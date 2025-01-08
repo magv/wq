@@ -1,0 +1,1206 @@
+#!/usr/bin/env python3
+"""\
+NAME
+    wq - a work queue for one person
+
+SYNOPSIS
+    wq [-h] [-F config] command args ...
+
+DESCRIPTION
+
+    Wq is a one-person Linux work queue. Like slurm or htcondor,
+    but for poor people with no root access.
+
+    To make it work:
+    - set up the config file,
+    - start a server in a screen/tmux session on some machine,
+    - start a worker in a screen/tmux session on each worker machine,
+    - submit your jobs.
+
+COMMANDS
+
+    wq submit [-h] [-C workdir] [-r resources] [-p priority] [-n name] command
+        Submit a command to the server for execution.
+
+    wq ls
+        List jobs.
+
+    wq lsw
+        List workers.
+
+    wq work [-S sleep]
+        Start or restart the worker on the current machine.
+
+    wq serve [-S sleep]
+        Start a server.
+
+OPTIONS
+    -h          show a help message and exit
+    -F config   use this configuration file
+    -S sleep    sleep this much time before working
+    -r resources
+
+CONFIGURATION
+
+    The configuration is stored in ~/.config/wq.toml, by default it is:
+
+        [client]
+        server_url = "http://127.0.0.1:8080"
+
+        [server]
+        host = "127.0.0.1"
+        port = 8080
+        database = "~/.local/share/wqserver.db"
+
+        [server.server_maintenance]
+        #period = ""
+        #command = ""
+
+        [server.worker_maintenance]
+        #period = ""
+        #command = ""
+
+ENVIRONMENT
+    TMPDIR      Temporary files will be created here.
+"""
+
+import argparse
+import asyncio
+import contextlib
+import datetime
+import errno
+import io
+import json
+import os
+import pwd
+import random
+import re
+import resource
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import traceback
+import types
+import typing
+
+import msgspec
+
+import aiohttp
+from aiohttp import web
+
+# Common utils
+
+def maybe_shorten(text:str, maxw:int) -> str:
+    if len(text) > maxw:
+        return text[:maxw-3] + "..."
+    else:
+        return text
+
+def itos(n:int) -> str:
+    C = "bcdfghjklmnpqrstvwxyz"
+    V = "aeiou"
+    letters = []
+    rem = 0
+    while n > 0:
+        syl = rem + (n % 2205)*991
+        n //= 2205
+        rem = syl // 2205
+        letters.append(C[syl % 21]); syl //= 21
+        letters.append(V[syl %  5]); syl //=  5
+        letters.append(C[syl % 21])
+    return "".join(letters)
+
+def groupby(items:typing.Iterable, key) -> dict:
+    key2items:dict = {}
+    for item in items:
+        k = key(item)
+        if k in key2items:
+            key2items[k].append(item)
+        else:
+            key2items[k] = [item]
+    return key2items
+
+def set_intersection(*sets) -> list:
+    a = set(sets[0])
+    for b in sets[1:]:
+        a = a.intersection(set(b))
+    return sorted(a)
+
+def set_union(*sets) -> list:
+    a = set(sets[0])
+    for b in sets[1:]:
+        a = a.union(set(b))
+    return sorted(a)
+
+def count(items:typing.Iterable) -> int:
+    return sum(1 for item in items if item)
+
+def print_table(rows, indent="", separator="  "):
+    if len(rows) == 0: return
+    rows = [[str(cell) for cell in row] for row in rows]
+    colw = [0] * max(len(row) for row in rows)
+    for row in rows:
+        for i, cell in enumerate(row):
+            colw[i] = max(colw[i], len(cell))
+    for row in rows:
+        if len(row) == 0:
+            print(indent + separator.join("-"*w for w in colw))
+        else:
+            print(indent + separator.join(cell.ljust(colw[i]) for i, cell in enumerate(row)).rstrip())
+
+def logf(message):
+    utcdate = datetime.datetime.now(datetime.timezone.utc)
+    print(utcdate.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f"), message, file=sys.stderr)
+
+def to_json(val) -> str:
+    return msgspec.json.encode(val).decode("utf8")
+
+def json_decoder(typ:type):
+    decoder = msgspec.json.Decoder(type=typ)
+    return lambda s: decoder.decode(s)
+
+# SQL (but not really) key-value database
+
+class KVDBTable:
+    def __init__(self, table:str, typ:type, db:"KVDB"):
+        self.table = table
+        self.typ = typ
+        self.encode = to_json
+        self.decode = json_decoder(typ)
+        self.cur = db._cur
+    def __setitem__(self, key:str, value:object):
+        args = (key, self.encode(value))
+        self.cur.execute(f"REPLACE INTO {self.table} (key, value) VALUES (?, ?)", args)
+    def setdefault(self, key:str, value:object):
+        args = (key, self.encode(value))
+        self.cur.execute(f"REPLACE INTO {self.table} (key, value) VALUES (?, ?)", args)
+    def __getitem__(self, key:str):
+        self.cur.execute(f"SELECT value FROM {self.table} WHERE key=?", (key,))
+        row = self.cur.fetchone()
+        if not row: raise KeyError(key)
+        try:
+            return self.decode(row[0])
+        except ValueError as e:
+            raise ValueError(f"while decoding {row[0]}: {e}")
+    def __contains__(self, key:str):
+        self.cur.execute(f"SELECT key FROM {self.table} WHERE key=?", (key,))
+        row = self.cur.fetchone()
+        return row is not None
+    def __len__(self):
+        self.cur.execute(f"SELECT count(*) FROM {self.table}")
+        row = self.cur.fetchone()
+        return row[0]
+    def __delitem__(self, key:str):
+        self.cur.execute(f"DELETE FROM {self.table} WHERE key=?", (key,))
+        if not self.cur.rowcount: raise KeyError(key)
+    def __iter__(self):
+        self.cur.execute(f"SELECT key FROM {self.table}")
+        for row in self.cur:
+            yield row[0]
+    def keys(self):
+        self.cur.execute(f"SELECT key FROM {self.table}")
+        for row in self.cur: yield row[0]
+    def items(self):
+        self.cur.execute(f"SELECT key, value FROM {self.table}")
+        for row in self.cur: yield (row[0], self.decode(row[1]))
+    def values(self):
+        self.cur.execute(f"SELECT value FROM {self.table}")
+        for row in self.cur:
+            yield self.decode(row[0])
+
+class KVDB:
+    def __init__(self, path:str, types:dict[str,type]):
+        self._db = sqlite3.connect(path)
+        self._db.executescript("PRAGMA journal_mode = wal;")
+        self._db.executescript("PRAGMA synchronous = off;")
+        self.tables = types
+        for name, typ in types.items():
+            self._db.executescript(f"""
+CREATE TABLE IF NOT EXISTS {name} (
+    key TEXT UNIQUE NOT NULL,
+    value TEXT NOT NULL
+);""")
+        self._db.commit()
+        self._db.autocommit = False
+        self._cur = self._db.cursor()
+    def sync(self):
+        self._db.commit()
+    def table(self, name:str):
+        return KVDBTable(name, self.tables[name], self)
+
+# Server Database
+
+class Worker(msgspec.Struct):
+    id: str
+    node: str
+    resources: dict[str, list[tuple[int, str, list[str]]]]
+    taken_jobs: list[str]
+    system: dict[str, int|float|str]
+    stats: dict[str, int|float]
+    first_seen: float
+    last_seen: float
+
+class JobStatus_Common(msgspec.Struct,
+                       tag_field="status",
+                       tag=lambda n: n.removeprefix("JobStatus_").lower()):
+    date: float
+class JobStatus_Added(JobStatus_Common): pass
+class JobStatus_Taken(JobStatus_Common): worker_id: str
+class JobStatus_Started(JobStatus_Common): worker_id: str; pid: int; res: object
+class JobStatus_Reassigned(JobStatus_Common): worker_id: str
+class JobStatus_Stopped(JobStatus_Common): worker_id: str; reason: str
+class JobStatus_Done(JobStatus_Common): worker_id: str; exit_code: int
+JobStatus = (
+    JobStatus_Added | JobStatus_Taken | JobStatus_Started |
+    JobStatus_Reassigned | JobStatus_Stopped | JobStatus_Done
+)
+
+class Job(msgspec.Struct):
+    id: str
+    name: str|None
+    command: str
+    environment: dict[str, str]
+    workdir: str
+    priority: int
+    resources: dict[str, tuple[int, str, list[str]]]
+    history: list[JobStatus]
+
+def webapi(fn):
+    async def handler(request):
+        try:
+            body = await request.json(loads=decoder)
+        except msgspec.ValidationError as e:
+            return web.HTTPBadRequest(reason=str(e))
+        data = await fn(**body)
+        return web.json_response(data, dumps=to_json)
+    decoder = msgspec.json.Decoder(
+            type=typing.TypedDict("ARGS", typing.get_type_hints(fn))).decode
+    return handler
+
+def has_enough_resources(available:dict[str,list[tuple[int,str,list[str]]]], requested:dict[str,tuple[int,str,list[str]]]):
+    for sys, (ramount, runit, rtags) in requested.items():
+        if sys not in available: return False
+        for aamount, aunit, atags in available[sys]:
+            if aunit == runit and all(f in atags for f in rtags) and aamount >= ramount:
+                break
+        else:
+            return False
+    return True
+
+class Server:
+    worker_index: int
+    job_index: int
+    workers: dict[str, Worker]
+    inactive_workers: dict[str, Worker]
+    jobs: dict[str, Job]
+    node2worker: dict[str, str]
+    kvdb: KVDB
+    worker_maintenance_period: float|None
+    worker_maintenance_command: str|None
+    def __init__(self, config:dict):#db_path m_period, m_command):
+        db_path = config["database"]
+        logf(f"Opening database {db_path!r}")
+        self.kvdb = KVDB(db_path, {
+            "jobs": Job,
+            "workers": Worker,
+            "inactive_workers": Worker,
+            "node2worker": str
+        })
+        self.jobs = self.kvdb.table("jobs")
+        self.workers = self.kvdb.table("workers")
+        self.inactive_workers = self.kvdb.table("inactive_workers")
+        self.node2worker = self.kvdb.table("node2worker")
+        self.worker_index = 0
+        self.job_index = 0
+        period = config["worker_maintenance"]["period"]
+        self.worker_maintenance_period = parse_seconds(period) if period else None
+        self.worker_maintenance_command = config["worker_maintenance"]["command"]
+        logf(f"Got {len(self.jobs)} jobs, "
+            f"{len(self.workers)} active workers, "
+            f"{len(self.inactive_workers)} inactive workers")
+
+    def sync(self):
+        self.kvdb.sync()
+
+    # Server browser interface
+
+    async def api_index(self, req):
+        return web.Response(text=f"Ugh.")
+
+    # Server API
+
+    async def api_post_job(self, name:str|None, command:str, resources:dict[str,tuple[int,str,list[str]]], priority:int, workdir:str, environment:dict[str,str]):
+        while True:
+            self.job_index += 1
+            id = itos(self.job_index)
+            if id not in self.jobs: break
+        job = Job(id=id, name=name, command=command, workdir=workdir, environment=environment, resources=resources, priority=priority, history=[JobStatus_Added(date=time.time())])
+        self.jobs[job.id] = job
+        self.kvdb.sync()
+        logf(f"New job {job.id!r}: {maybe_shorten(command, 40)!r}")
+        return {"job_id": job.id}
+
+    async def api_register_worker(self, node:str, resources:dict[str,list[tuple[int,str,list[str]]]], system:dict[str,int|float|str], stats:dict[str,int|float]):
+        if node in self.node2worker:
+            worker_id = self.node2worker[node]
+            worker = self.workers[worker_id]
+            logf(f"Worker from node {node!r} ({system}) wants to register, but {worker.id!r} is already there")
+            return {"worker_id": None, "past_worker": worker}
+        while True:
+            self.worker_index += 1
+            id = itos(self.worker_index)
+            if id not in self.workers and id not in self.inactive_workers: break
+        now = time.time()
+        worker = Worker(id=id,
+                    node=node,
+                    resources=resources,
+                    system=system,
+                    stats=stats,
+                    first_seen=now,
+                    last_seen=now,
+                    taken_jobs=[])
+        self.workers[worker.id] = worker
+        self.node2worker[worker.node] = worker.id
+        self.kvdb.sync()
+        logf(f"Worker {worker.id!r} (node {node!r}) started on {system!r}")
+        return {"worker_id": worker.id}
+
+    async def api_replace_worker(self, worker_id:str, resources:dict[str,list[tuple[int,str,list[str]]]], system:dict[str,int|float|str], stats:dict[str,int|float]):
+        if worker_id not in self.workers:
+            raise web.HTTPBadRequest(reason=f"bad worker id")
+        past_worker = self.workers[worker_id]
+        # Create new worker
+        while True:
+            self.worker_index += 1
+            id = itos(self.worker_index)
+            if id not in self.workers and id not in self.inactive_workers: break
+        now = time.time()
+        worker = Worker(id=id,
+                    node=past_worker.node,
+                    resources=resources,
+                    system=system,
+                    stats=stats,
+                    first_seen=now,
+                    last_seen=now,
+                    taken_jobs=[])
+        # Reassign past jobs
+        for jobid in past_worker.taken_jobs:
+            job = self.jobs[jobid]
+            job.history.append(JobStatus_Reassigned(date=now, worker_id=worker.id))
+            self.jobs[job.id] = job
+            worker.taken_jobs.append(job.id)
+        past_worker.taken_jobs = []
+        # Deactivate past worker
+        del self.workers[worker_id]
+        self.inactive_workers[worker_id] = past_worker
+        # Record new worker
+        self.workers[worker.id] = worker
+        self.node2worker[worker.node] = worker.id
+        self.kvdb.sync()
+        logf(f"Worker {worker.id!r} (node {worker.node!r}) took over from {past_worker.id!r} on {system!r}")
+        return {"worker_id": worker.id, "job_ids": worker.taken_jobs}
+
+    async def api_update_worker(self, worker_id:str, stats:dict[str,int|float]):
+        if worker_id not in self.workers:
+            raise web.HTTPBadRequest(reason=f"bad worker id")
+        worker = self.workers[worker_id]
+        worker.last_seen = time.time()
+        worker.stats = stats
+        self.workers[worker.id] = worker
+        self.kvdb.sync()
+        return {}
+
+    async def api_worker_config(self, worker_id:str):
+        if worker_id not in self.workers:
+            raise web.HTTPBadRequest(reason=f"bad worker id")
+        #worker = self.workers[worker_id]
+        return {
+            "maintenance_period":  self.worker_maintenance_period,
+            "maintenance_command": self.worker_maintenance_command
+        }
+
+    async def api_unregister_worker(self, worker_id:str):
+        if worker_id not in self.workers:
+            raise web.HTTPBadRequest(reason=f"bad worker id")
+        worker = self.workers[worker_id]
+        if not worker.taken_jobs:
+            self.inactive_workers[worker_id] = worker
+            del self.workers[worker_id]
+            del self.node2worker[worker.node]
+            self.kvdb.sync()
+            logf(f"Worker {worker_id!r} has exited")
+        else:
+            logf(f"Worker {worker_id!r} has exited, but still has jobs")
+        return {}
+
+    async def api_take_job(self, worker_id:str, resources:dict[str,list[tuple[int,str,list[str]]]], stats:dict[str,int|float]):
+        if worker_id not in self.workers:
+            raise web.HTTPBadRequest(reason=f"bad worker id")
+        now = time.time()
+        worker = self.workers[worker_id]
+        worker.last_seen = now
+        worker.stats = stats
+        self.workers[worker.id] = worker
+        self.kvdb.sync()
+        for repeat in range(2):
+            for job in self.jobs.values():
+                if not isinstance(job.history[-1], JobStatus_Added): continue
+                if has_enough_resources(resources, job.resources):
+                    job.history.append(JobStatus_Taken(
+                        date = time.time(),
+                        worker_id = worker.id
+                    ))
+                    worker.taken_jobs.append(job.id)
+                    self.jobs[job.id] = job
+                    self.workers[worker.id] = worker
+                    self.kvdb.sync()
+                    logf(f"Job {job.id!r} is taken by {worker_id!r}")
+                    return {"job": job}
+            await asyncio.sleep(1)
+        raise web.HTTPRequestTimeout(reason=f"no jobs")
+
+    async def api_job_started(self, worker_id:str, job_id:str, pid:int, allocation:object):
+        if worker_id not in self.workers:
+            raise web.HTTPBadRequest(reason=f"bad worker id")
+        worker = self.workers[worker_id]
+        if job_id not in self.jobs:
+            raise web.HTTPBadRequest(reason=f"bad job id")
+        job = self.jobs[job_id]
+        job.history.append(JobStatus_Started(
+            date = time.time(),
+            worker_id = worker.id,
+            pid = pid,
+            res = allocation
+        ))
+        self.jobs[job.id] = job
+        self.kvdb.sync()
+        logf(f"Job {job.id!r} is started by {worker.id!r}, pid {pid}, res {allocation}")
+        return {}
+
+    async def api_cancel_job(self, worker_id:str, job_id:str, reason:str):
+        if worker_id not in self.workers:
+            raise web.HTTPBadRequest(reason=f"bad worker id")
+        worker = self.workers[worker_id]
+        if job_id not in self.jobs:
+            raise web.HTTPBadRequest(reason=f"bad job id")
+        job = self.jobs[job_id]
+        job.history.append(JobStatus_Stopped(
+            date = time.time(),
+            worker_id = worker.id,
+            reason = reason
+        ))
+        worker.last_seen = time.time()
+        worker.taken_jobs.remove(job.id)
+        self.jobs[job.id] = job
+        self.workers[worker.id] = worker
+        self.kvdb.sync()
+        logf(f"Job {job.id!r} is cancelled by {worker.id!r} because: {reason!r}")
+        return {}
+
+    async def api_finish_job(self, worker_id:str, job_id:str, exit_code:int):
+        if worker_id not in self.workers:
+            raise web.HTTPBadRequest(reason=f"bad worker id")
+        worker = self.workers[worker_id]
+        if job_id not in self.jobs:
+            raise web.HTTPBadRequest(reason=f"bad job id")
+        job = self.jobs[job_id]
+        job.history.append(JobStatus_Done(
+            date = time.time(),
+            worker_id = worker.id,
+            exit_code = exit_code
+        ))
+        worker.last_seen = time.time()
+        worker.taken_jobs.remove(job.id)
+        self.jobs[job.id] = job
+        self.workers[worker.id] = worker
+        self.kvdb.sync()
+        logf(f"Job {job.id!r} is finished by {worker.id!r}, exit code {exit_code}")
+        return {}
+
+    async def api_ls(self):
+        return {
+            "jobs": [j for j in self.jobs.values()],
+            "workers": [w for w in self.workers.values()]
+        }
+
+    async def api_ls_job(self, job_id:str):
+        if job_id not in self.jobs:
+            raise web.HTTPBadRequest(reason=f"bad job id")
+        return self.jobs[job_id]
+
+    async def api_lsw(self):
+        return {
+            "workers": [w for w in self.workers.values()]
+        }
+
+async def main_serve(config, sleep:str|None):
+    if sleep is not None:
+        duration = parse_seconds(sleep)
+        await asyncio.sleep(duration*(0.8 + 0.4*random.random()))
+    srv = Server(config["server"])
+    app = web.Application()
+    app["wq_server"] = srv
+    app["wq_config"] = config
+    app.add_routes([
+        web.get("/",                        srv.api_index),
+        web.post("/api/cancel_job",         webapi(srv.api_cancel_job)),
+        web.post("/api/finish_job",         webapi(srv.api_finish_job)),
+        web.post("/api/job_started",        webapi(srv.api_job_started)),
+        web.post("/api/ls",                 webapi(srv.api_ls)),
+        web.post("/api/ls_job",             webapi(srv.api_ls_job)),
+        web.post("/api/lsw",                webapi(srv.api_lsw)),
+        web.post("/api/post_job",           webapi(srv.api_post_job)),
+        web.post("/api/register_worker",    webapi(srv.api_register_worker)),
+        web.post("/api/replace_worker",     webapi(srv.api_replace_worker)),
+        web.post("/api/take_job",           webapi(srv.api_take_job)),
+        web.post("/api/unregister_worker",  webapi(srv.api_unregister_worker)),
+        web.post("/api/update_worker",      webapi(srv.api_update_worker)),
+        web.post("/api/worker_config",      webapi(srv.api_worker_config)),
+    ])
+    async def maintenance(app):
+        srv = app["wq_server"]
+        cfg = app["wq_config"]
+        period = cfg["server"]["server_maintenance"]["period"]
+        period = parse_seconds(period) if period else None
+        command = cfg["server"]["server_maintenance"]["command"]
+        if period and command:
+            while True:
+                logf("Starting server maintenance script")
+                try:
+                    with tempfile.NamedTemporaryFile("w", suffix=".sh", encoding="utf-8") as f:
+                        f.write(command)
+                        f.flush()
+                        proc = await asyncio.create_subprocess_exec(
+                            "/bin/sh", f.name,
+                            stdin=asyncio.subprocess.DEVNULL)
+                        rc = await proc.wait()
+                    logf(f"Server maintenance finished with code {rc}, will repeat in {period}s")
+                except Exception as e:
+                    logf(f"Server maintenance failed: {e}, will repeat in {period}s")
+                await asyncio.sleep(period*(0.8 + 0.4*random.random()))
+
+    async def background_tasks(app):
+        task = asyncio.create_task(maintenance(app))
+        yield
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    app.cleanup_ctx.append(background_tasks)
+    await web._run_app(app, host=config["server"]["host"], port=config["server"]["port"])
+
+# Worker Resources
+
+#class Resources:
+#    def allocate(self, spec:dict[str,int]) -> Allocation: pass
+#    def free(self, allocation:Allocation) -> Null: pass
+#    def restrict(self, allocation, popen_args:dict) -> dict: pass
+
+class ResourceCPU(msgspec.Struct):
+    index: int
+    core: int
+    socket: int
+    tags: list[str]
+    allowed: bool
+    free: bool
+
+def tags_match(tags:list[str], required_tags:list[str]):
+    for tag in required_tags:
+        if tag not in tags: return False
+    return True
+
+class Resources_CPU:
+    processors: list[ResourceCPU]
+    def __init__(self):
+        affinity = os.sched_getaffinity(0)
+        with open("/proc/cpuinfo", "r") as f:
+            text = f.read()
+        processors = []
+        for processor_text in text.split("\n\n"):
+            data = {}
+            for line in processor_text.splitlines():
+                k, v = line.split(":", 1)
+                data[k.strip()] = v.strip()
+            if not data: continue
+            index = int(data["processor"])
+            core = int(data["core id"])
+            socket = int(data["physical id"])
+            tags = data["flags"].lower().split()
+            vendor = data["vendor_id"].lower()
+            if vendor == "authenticamd": vendor = "amd"
+            if vendor == "genuineintel": vendor = "intel"
+            tags.append(vendor)
+            tags = tuple(sorted(set(tags)))
+            allowed = index in affinity
+            processors.append(ResourceCPU(index, core, socket, tags, allowed, True))
+        self.processors = sorted(processors, key=lambda p: p.index)
+    def units(self):
+        return ("cpu", "core", "socket", "node")
+    def reserve(self, count:int, unit:str, fltr:list[str]) -> list[int]:
+        cpus = [p for p in self.processors
+                if p.allowed and p.free and tags_match(p.tags, fltr)]
+        match unit:
+            case "cpu": cpus = cpus[:count]
+            #case "core": TODO
+            #case "socket": TODO
+            case "node": pass
+            case _: raise ValueError(f"Unknown CPU unit {unit!r}")
+        for p in cpus: p.free = False
+        return [p.index for p in cpus]
+    def free(self, allocation:list[int]) -> None:
+        for idx in allocation:
+            self.processors[idx].free = True
+    def restrict(self, allocation:list[int], popen_args:dict) -> dict:
+        popen_args["env"]["WQ_THREADS"] = str(len(allocation))
+        popen_args["env"]["WQ_CPU_LIST"] = ",".join(str(idx) for idx in allocation)
+        popen_args["env"]["OMP_NUM_THREADS"] = str(len(allocation))
+        popen_args["env"]["OMP_PROC_BIND"] = "true"
+        return popen_args
+    def report(self) -> list[tuple[int, str, list[str]]]:
+        units = []
+        # List processors per tag set
+        for tags, cpus in groupby(self.processors, key=lambda p: p.tags).items():
+            c = count(p.allowed and p.free for p in cpus)
+            units.append((c, "cpu", tags))
+        # List cores per tag set
+        cores = groupby(self.processors, key=lambda p: p.core)
+        core_tags = {k:tuple(set_intersection(*[p.tags for p in cpus])) for k, cpus in cores.items()}
+        for tags, ids in groupby(cores.keys(), lambda p: core_tags[p]).items():
+            c = count(all(p.allowed and p.free for p in cores[c]) for c in ids)
+            units.append((c, "core", tags))
+        # List sockets per tag set
+        sockets = groupby(self.processors, key=lambda p: p.socket)
+        socket_tags = {k:tuple(set_intersection(*[p.tags for p in cpus])) for k, cpus in sockets.items()}
+        for tags, ids in groupby(sockets.keys(), lambda p: socket_tags[p]).items():
+            c = count(all(p.allowed and p.free for p in sockets[c]) for c in ids)
+            units.append((c, "socket", tags))
+        # List nodes per tag set
+        node_tags = set_intersection(*[p.tags for p in self.processors])
+        c = 1 if all(p.allowed and p.free for p in self.processors) else 0
+        units.append((c, "node", list(node_tags)))
+        return units
+
+def parse_quantity(value:str, units:dict[str, float]) -> float:
+    m = re.fullmatch("([0-9.]*) *([a-zA-Z]*)", value)
+    if m is None: raise ValueError(value)
+    quantity, unit = m.groups()
+    if unit not in units: raise ValueError(value)
+    return float(quantity)*units[unit]
+
+def parse_bytes(size:str) -> int:
+    return int(parse_quantity(size, {
+        "": 1, "b": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3, "tb": 1024**4
+    }))
+
+def parse_seconds(duration:str) -> float:
+    return parse_quantity(duration, {
+        "": 1, "s": 1, "m": 60, "h": 60*60, "d": 24*60*60, "w": 7*24*60*60
+    })
+
+class Resources_Mem:
+    total: int
+    available: int
+    def __init__(self):
+        cores = {}
+        with open("/proc/meminfo", "r") as f:
+            text = f.read()
+        data = {}
+        for line in text.splitlines():
+            k, v = line.lower().split(":", 1)
+            data[k.strip()] = v.strip()
+        self.total = parse_bytes(data["memavailable"])
+        self.available = self.total
+    def reserve(self, count:int, unit:str, fltr:str) -> int:
+        assert unit == "b"
+        return count
+    def free(self, allocation:int) -> None:
+        self.available += allocation
+    def restrict(self, allocation, popen_args):
+        return popen_args
+    def units(self):
+        return ("b",)
+    def report(self):
+        return [(self.available, "b", [])]
+
+class Resources_Disk:
+    tmpdir: str
+    total: int
+    available: int
+    def __init__(self, tmpdir):
+        cores = {}
+        output = subprocess.check_output(["df", tmpdir], encoding="utf-8").splitlines()
+        self.tmpdir = tmpdir
+        self.total = int(output[1].split()[3])*1024
+        self.available = self.total
+    def reserve(self, count:int, unit:str, fltr:str) -> int:
+        assert unit == "b"
+        return count
+    def free(self, allocation:int) -> None:
+        self.available += allocation
+    def restrict(self, allocation, popen_args):
+        jobid = popen_args["env"]["WQ_JOBID"]
+        tmpdir = os.path.join(self.tmpdir, f"wq_{jobid}")
+        os.mkdir(tmpdir, mode=0o700)
+        popen_args["env"]["TMPDIR"] = tmpdir
+        return popen_args
+    def units(self):
+        return ("b",)
+    def report(self):
+        return [(self.available, "b", [])]
+
+# Worker
+
+def meminfo() -> dict[str, str]:
+    meminfo = {}
+    with open("/proc/meminfo", "r") as f:
+        for line in f:
+            k, v = line.lower().split(":", 1)
+            meminfo[k.strip()] = v.strip()
+    return meminfo
+
+def read_string(path:str, default):
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return default
+
+def system_info() -> dict:
+    euid = os.geteuid()
+    uname = os.uname()
+    pid = os.getpid()
+    return {
+        "hostname": uname.nodename,
+        "username": pwd.getpwuid(euid).pw_name,
+        "pid": pid,
+        "comm": read_string(f"/proc/{pid}/comm", None),
+        "cmdline": read_string(f"/proc/{pid}/cmdline", None),
+        "sysname": uname.sysname,
+        "release": uname.release,
+        "version": uname.version,
+        "machine": uname.machine,
+        "machine_id": read_string("/etc/machine-id", None),
+        "boot_id": read_string("/proc/sys/kernel/random/boot_id", None)
+    }
+
+def is_worker_running(sysinfo:dict) -> bool:
+    pid = sysinfo["pid"]
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        if e.errno == errno.ESRCH:
+            return False
+    comm = read_string(f"/proc/{pid}/comm", None)
+    cmdline = read_string(f"/proc/{pid}/cmdline", None)
+    print(comm, sysinfo["comm"])
+    return comm == sysinfo["comm"] and cmdline == sysinfo["cmdline"]
+
+def system_stats() -> dict:
+    mi = meminfo()
+    uptime = read_string("/proc/uptime", "").split()[0]
+    return {
+        "loadavg": max(os.getloadavg()),
+        "memtotal": parse_bytes(mi["memtotal"]),
+        "memavailable": parse_bytes(mi["memavailable"]),
+        "memfree": parse_bytes(mi["memfree"]),
+        "uptime": float(uptime) if uptime else None
+    }
+
+def forkoff(preaction, action):
+    r, w = os.pipe()
+    try:
+        child = os.fork()
+        if child > 0:
+            # Original process, after fork
+            os.close(w)
+            with os.fdopen(r, "r") as f:
+                return f.read()
+    except OSError as e:
+        exit(1)
+    # Child process
+    pid = os.setsid()
+    for fd in range(3, resource.getrlimit(resource.RLIMIT_NOFILE)[0]):
+        if fd != w:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    devnull_fd = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull_fd, 0)
+    os.dup2(devnull_fd, 1)
+    os.dup2(devnull_fd, 2)
+    os.close(devnull_fd)
+    try:
+        grandchild = os.fork()
+        if grandchild > 0:
+            exit(0)
+    except OSError as e:
+        exit(1)
+    # Grandchild process
+    try:
+        preaction()
+        with os.fdopen(w, "w") as f:
+            f.write(str(preaction()))
+        action()
+        exit(0)
+    except Exception as e:
+        exit(1)
+
+class RunningCommand(msgspec.Struct):
+    job_id:str
+    allocation:object
+    pid_path:str
+    status_path:str
+
+def start_command(job, resources):
+    env = job["environment"].copy()
+    env["WQ_JOBID"] = job["id"]
+    popen_args = {
+        "args": ["/usr/bin/time", "/bin/sh", "-c", job["command"]],
+        "cwd": job["workdir"],
+        "env": env
+    }
+    allocation = {}
+    for key, rsys in resources.items():
+        alloc = rsys.reserve(*job["resources"].get(key, (0, None, None)))
+        popen_args = rsys.restrict(alloc, popen_args)
+        allocation[key] = alloc
+    tmpdir = popen_args["env"]["TMPDIR"]
+    pid_path = os.path.join(tmpdir, job["id"] + ".wqpid")
+    alloc_path = os.path.join(tmpdir, job["id"] + ".wqalloc")
+    status_path = os.path.join(tmpdir, job["id"] + ".wqstatus")
+    with open(alloc_path, "wb") as f:
+        f.write(msgspec.json.encode(allocation))
+    try:
+        proc = subprocess.run(
+                ["wq", "runcmd", pid_path, status_path],
+                input=msgspec.json.encode(popen_args))
+        if proc.returncode != 0:
+            raise OSError("Failed to launch command")
+        return RunningCommand(job_id=job["id"],
+                              allocation=allocation,
+                              pid_path=pid_path,
+                              status_path=status_path)
+    except Exception as e:
+        for key, rsys in resources.items():
+            rsys.free(allocation[key])
+        raise
+
+def take_over_command(job_id):
+    tmpdir = os.environ.get("TMPDIR", "/tmp")
+    tmpdir = os.path.join(tmpdir, f"wq_{job_id}")
+    pid_path = os.path.join(tmpdir, job_id + ".wqpid")
+    alloc_path = os.path.join(tmpdir, job_id + ".wqalloc")
+    status_path = os.path.join(tmpdir, job_id + ".wqstatus")
+    with open(alloc_path, "rb") as f:
+        allocation = msgspec.json.decode(f.read())
+    return RunningCommand(job_id=job_id,
+                          allocation=allocation,
+                          pid_path=pid_path,
+                          status_path=status_path)
+
+def finalize_command(command, resources):
+    for key, rsys in resources.items():
+        rsys.free(command.allocation[key])
+
+RPC_MINSLEEP = 1
+RPC_MAXSLEEP = 30
+
+class RPC:
+    def __init__(self, config):
+        self.server_url = config["client"]["server_url"]
+        self.session = aiohttp.ClientSession()
+    async def __aenter__(self):
+        await self.session.__aenter__()
+        return self
+    async def __aexit__(self, exc, exc_typ, tb):
+        await self.session.__aexit__(exc, exc_typ, tb)
+    async def __call__(self, method:str, data:dict={}, repeat=True):
+        timeout = RPC_MINSLEEP
+        while True:
+            try:
+                async with self.session.post(f"{self.server_url}/api/{method}", json=data) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    logf(f"RPC {method}() returned code {resp.status}: {resp.reason}")
+            except OSError as e:
+                logf(f"Failed to complete RPC call: {e}")
+            except aiohttp.client_exceptions.ClientError as e:
+                logf(f"Failed to complete RPC call: {e}")
+            if not repeat: return None
+            await asyncio.sleep(timeout*(0.8 + 0.4*random.random()))
+            timeout = min(RPC_MAXSLEEP, timeout*2)
+
+async def main_work(config, sleep:str|None):
+    if sleep is not None:
+        duration = parse_seconds(sleep)
+        await asyncio.sleep(duration*(0.8 + 0.4*random.random()))
+    tmpdir = os.environ.get("TMPDIR", "/tmp")
+    resources = {
+        "cpu": Resources_CPU(),
+        "mem": Resources_Mem(),
+        "tmp": Resources_Disk(tmpdir)
+    }
+    commands:list[RunningCommand] = []
+    last_maintenance = None
+    async with RPC(config) as rpc:
+        si = system_info()
+        reg = await rpc("register_worker", {
+            "node": si["machine_id"] or si["hostname"],
+            "resources": {k: r.report() for k, r in resources.items()},
+            "system": si,
+            "stats": system_stats()
+        })
+        if reg["worker_id"] is None:
+            if is_worker_running(reg["past_worker"]["system"]):
+                logf(f"Already running as {reg['past_worker']}")
+                exit(1)
+            else:
+                logf(f"Previous worker failed {reg['past_worker']}")
+                reg = await rpc("replace_worker", {
+                    "worker_id": reg["past_worker"]["id"],
+                    "resources": {k: r.report() for k, r in resources.items()},
+                    "system": si,
+                    "stats": system_stats()
+                })
+                for job_id in reg["job_ids"]:
+                    cmd = take_over_command(job_id)
+                    commands.append(cmd)
+        conf = await rpc("worker_config", {"worker_id": reg["worker_id"]})
+
+        try:
+            while True:
+                # Maintenance, if needed
+                period = conf["maintenance_period"]
+                if period is not None:
+                    if last_maintenance is None or last_maintenance <= time.time() - period:
+                        logf("Starting maintenance script")
+                        try:
+                            with tempfile.NamedTemporaryFile("w", suffix=".sh", encoding="utf-8") as f:
+                                f.write(conf["maintenance_command"])
+                                f.flush()
+                                proc = await asyncio.create_subprocess_exec(
+                                    "/bin/sh", f.name,
+                                    stdin=asyncio.subprocess.DEVNULL)
+                                rc = await proc.wait()
+                            logf(f"Maintenance finished with code {rc}, will repeat in {period}s")
+                        except Exception as e:
+                            logf(f"Maintenance failed: {e}, will repeat in {period}s")
+                        last_maintenance = time.time()
+                # Get some work from the server
+                resp = await rpc("take_job", {
+                        "worker_id": reg["worker_id"],
+                        "resources": {k: r.report() for k, r in resources.items()},
+                        "stats": system_stats()
+                    }, repeat=False)
+                if resp is not None:
+                    logf(f"New job (currently have {len(commands)}): {resp}")
+                    try:
+                        cmd = start_command(resp["job"], resources)
+                        commands.append(cmd)
+                    except Exception as e:
+                        logf(f"Exception while starting: {type(e).__name__}: {e}")
+                        logf(traceback.format_exc())
+                        await rpc("cancel_job", {
+                            "worker_id": reg["worker_id"],
+                            "job_id": resp["job"]["id"],
+                            "reason": f"Exception while starting: {type(e).__name__}: {e}"
+                        })
+                    else:
+                        await rpc("job_started", {
+                            "worker_id": reg["worker_id"],
+                            "job_id": cmd.job_id,
+                            "pid": 999,
+                            "allocation": cmd.allocation
+                        })
+                # Poll running commands
+                for i, cmd in reversed(list(enumerate(commands))):
+                    if os.path.exists(cmd.status_path):
+                        with open(cmd.status_path, "r") as f:
+                            rc = int(f.read())
+                        logf(f"Command {cmd} is done, exit code: {rc}")
+                        finalize_command(cmd, resources)
+                        commands.pop(i)
+                        await rpc("finish_job", {
+                            "worker_id": reg["worker_id"],
+                            "job_id": cmd.job_id,
+                            "exit_code": rc
+                        })
+                await asyncio.sleep(0.8 + 0.4*random.random())
+        finally:
+            await rpc("unregister_worker", {"worker_id": reg["worker_id"]})
+
+def main_runcmd(pid_path:str, status_path:str):
+    popen_args = json.load(sys.stdin)
+    cpu_list = popen_args["env"].get("WQ_CPU_LIST", None)
+    if cpu_list:
+        os.sched_setaffinity(0, [int(i) for i in cpu_list.split(",")])
+    def daemon_start():
+        with open(pid_path, "w") as f:
+            f.write(str(os.getpid()))
+        return "ok"
+    def daemon_work():
+        proc = subprocess.Popen(**popen_args)
+        rcode = proc.wait()
+        status_tmppath = status_path + ".tmp"
+        with open(status_tmppath, "w") as f:
+            f.write(str(rcode))
+        os.rename(status_tmppath, status_path)
+    res = forkoff(daemon_start, daemon_work)
+    if res != "ok": exit(1)
+
+# Client
+
+async def main_ls_job(config, job_id):
+    async with RPC(config) as rpc:
+        job = await rpc("ls_job", {"job_id": job_id})
+        print("Properties:")
+        print_table([
+            ["id", repr(job["id"])],
+            ["name", repr(job["name"])],
+            ["command", repr(job["command"])],
+            ["dir", repr(job["workdir"])],
+            ["priority", repr(job["priority"])]
+        ], indent="  ")
+        print()
+        print("Required resources:")
+        print_table([
+            (key, value, unit, " ".join(tags))
+            for key, (value, unit, tags) in job["resources"].items()
+        ], indent="  ")
+        print()
+        print("History:")
+        table = []
+        for s in job["history"]:
+            table.append([
+                time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s["date"])),
+                s["status"]
+            ])
+        print_table(table, indent="  ")
+
+async def main_ls(config, job_id):
+    if job_id is not None: return await main_ls_job(config, job_id)
+    async with RPC(config) as rpc:
+        o = await rpc("ls")
+        jobs = o["jobs"]
+        table = [["id", "prio", "w", "s", "dir", "command"]]
+        for j in jobs:
+            status = j["history"][-1]
+            match status["status"]:
+                case "added":
+                    W = " "
+                    S = "-"
+                case "taken" | "started" | "reassigned":
+                    W = status["worker_id"]
+                    S = ">"
+                case "stopped":
+                    W = " "
+                    S = "!"
+                case "done":
+                    W = " "
+                    S = "∙" if j["history"][-1]["exit_code"] == 0 else "X"
+                case _:
+                    W = S = "?"
+            table.append([
+                j["id"],
+                j["priority"],
+                W,
+                S,
+                j["workdir"],
+                maybe_shorten(j["command"], 50)
+        ])
+        print_table(table)
+
+async def main_lsw(config):
+    async with RPC(config) as rpc:
+        o = await rpc("lsw")
+        table = [["id", "hostname", "jobs"]]
+        for w in o["workers"]:
+            table.append([w["id"], w["system"]["hostname"], len(w["taken_jobs"])])
+        print_table(table)
+
+async def main_submit(config, name:str|None, script:str, workdir:str, resdefs:list[str], prio:int):
+    resources = {}
+    for spec in resdefs:
+        m = re.match(r"([^=.+]*)(?:[.]([^=.]*))?=([0-9]*)(.*)", spec)
+        if m is None:
+            raise ValueError(f"Bad resource syntax: {spec}")
+        sys, fltr, val, unit = m.groups()
+        # TODO: validate
+        resources[sys] = (int(val), unit or None, fltr.split("+") if fltr else [])
+    resources.setdefault("cpu", (1, "cpu", []))
+    resources.setdefault("mem", (1024**3, "b", []))
+    resources.setdefault("tmp", (1024**3, "b", []))
+    async with RPC(config) as rpc:
+        jobdata = await rpc("post_job", {
+            "name": name,
+            "command": script,
+            "workdir": os.path.abspath(workdir),
+            "resources": resources,
+            "environment": dict(os.environ),
+            "priority": prio
+        })
+        print(jobdata)
+
+if __name__ == "__main__":
+
+    homedir = os.environ["HOME"]
+    confdir = os.environ.get("XDG_CONFIG_HOME", os.path.join(homedir, ".config"))
+    datadir = os.environ.get("XDG_DATA_HOME", os.path.join(homedir, ".local", "share"))
+
+    parser = argparse.ArgumentParser(prog="wq")
+    parser.print_help = lambda: print(__doc__, end="")
+    parser.add_argument("-F", "--config", action="store", default=os.path.join(confdir, "wq.toml"), metavar="file")
+    parser_cmd = parser.add_subparsers(dest="cmd")
+    p = parser_cmd.add_parser("serve")
+    p.add_argument("-S", "--sleep", action="store", default=None)
+    p = parser_cmd.add_parser("ls")
+    p.add_argument("job_id", action="store", default=None, nargs="?")
+    p = parser_cmd.add_parser("lsw")
+    p = parser_cmd.add_parser("work")
+    p.add_argument("-S", "--sleep", action="store", default=None)
+    p = parser_cmd.add_parser("submit")
+    p.add_argument("script")
+    p.add_argument("-C", "--directory", action="store", default=os.getcwd())
+    p.add_argument("-n", "--name", action="store", default=None)
+    p.add_argument("-r", "--resources", action="append", default=[])
+    p.add_argument("-p", "--priority", action="store", default=0, type=int)
+    p = parser_cmd.add_parser("runcmd")
+    p.add_argument("pid_path", action="store")
+    p.add_argument("status_path", action="store")
+    args = parser.parse_args()
+
+    if args.cmd == "runcmd":
+        main_runcmd(args.pid_path, args.status_path)
+        exit(0)
+
+    config = {}
+    if os.path.exists(args.config):
+        with open(args.config, "rb") as f:
+            config = tomllib.load(f)
+    config.setdefault("client", {})
+    config.setdefault("server", {})
+    config.setdefault("worker", {})
+    config["client"].setdefault("server_url", "http://127.0.0.1:8080")
+    config["server"].setdefault("database", os.path.join(datadir, "wqserver.db"))
+    config["server"].setdefault("host", "127.0.0.1")
+    config["server"].setdefault("port", 8080)
+    config["server"].setdefault("server_maintenance", {})
+    config["server"].setdefault("worker_maintenance", {})
+    config["server"]["server_maintenance"].setdefault("command", None)
+    config["server"]["server_maintenance"].setdefault("period", None)
+    config["server"]["worker_maintenance"].setdefault("command", None)
+    config["server"]["worker_maintenance"].setdefault("period", None)
+
+    try:
+        match args.cmd:
+            case "ls":      asyncio.run(main_ls(config, args.job_id))
+            case "lsw":     asyncio.run(main_lsw(config))
+            case "serve":   asyncio.run(main_serve(config, args.sleep))
+            case "submit":  asyncio.run(main_submit(config, args.name, args.script, args.directory, args.resources, args.priority))
+            case "work":    asyncio.run(main_work(config, args.sleep))
+            case _: print(__doc__, end="")
+    except KeyboardInterrupt:
+        exit(1)
