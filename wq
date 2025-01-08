@@ -1125,10 +1125,11 @@ async def main_ls(config, job_id):
 async def main_lsw(config):
     async with RPC(config) as rpc:
         o = await rpc("lsw")
-        table = [["id", "hostname", "jobs"]]
+        table = []
         for w in o["workers"]:
             table.append([w["id"], w["system"]["hostname"], len(w["taken_jobs"])])
-        print_table(table)
+        table.sort(key=lambda row: row[1])
+        print_table([["id", "hostname", "jobs"]] + table)
 
 async def main_submit(config, name:str|None, script:str, workdir:str, resdefs:list[str], prio:int):
     resources = {}
