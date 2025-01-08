@@ -1129,9 +1129,9 @@ async def main_lsw(config):
         o = await rpc("lsw")
         table = []
         for w in o["workers"]:
-            table.append([w["id"], w["system"]["hostname"], len(w["taken_jobs"])])
+            table.append([w["id"], w["system"]["hostname"], len(w["taken_jobs"]), w["stats"]["loadavg"]])
         table.sort(key=lambda row: row[1])
-        print_table([["id", "hostname", "jobs"]] + table)
+        print_table([["id", "hostname", "jobs", "load"]] + table)
 
 async def main_submit(config, name:str|None, script:str, workdir:str, resdefs:list[str], prio:int):
     resources = {}
