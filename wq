@@ -537,10 +537,10 @@ class Server:
         }
 
 async def main_serve(config, sleep:str|None):
+    srv = Server(config["server"])
     if sleep is not None:
         duration = parse_seconds(sleep)
         await asyncio.sleep(duration*(0.8 + 0.4*random.random()))
-    srv = Server(config["server"])
     app = web.Application()
     app["wq_server"] = srv
     app["wq_config"] = config
@@ -581,7 +581,6 @@ async def main_serve(config, sleep:str|None):
                 except Exception as e:
                     logf(f"Server maintenance failed: {e}, will repeat in {period}s")
                 await asyncio.sleep(period*(0.8 + 0.4*random.random()))
-
     async def background_tasks(app):
         task = asyncio.create_task(maintenance(app))
         yield
@@ -1053,6 +1052,16 @@ def main_runcmd(pid_path:str, status_path:str):
 
 # Client
 
+def status_line(status):
+    match status["status"]:
+        case "added": return "added"
+        case "taken": return f"taken by {status['worker_id']!r}"
+        case "started": return f"started by {status['worker_id']!r}"
+        case "reassigned": return f"reassigned to {status['worker_id']!r}"
+        case "stopped": return f"stopped by {status['worker_id']!r}"
+        case "done": return f"done by {status['worker_id']!r}"
+        case x: return x
+
 async def main_ls_job(config, job_id):
     async with RPC(config) as rpc:
         job = await rpc("ls_job", {"job_id": job_id})
@@ -1076,7 +1085,7 @@ async def main_ls_job(config, job_id):
         for s in job["history"]:
             table.append([
                 time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s["date"])),
-                s["status"]
+                status_line(s)
             ])
         print_table(table, indent="  ")
 
