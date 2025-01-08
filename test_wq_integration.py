@@ -30,16 +30,16 @@ def basic_setup(config={}):
         confpath = os.path.join(tmpdir, "wq.toml")
         with open(confpath, "wb") as f:
             tomli_w.dump(config, f)
-        yield {"tmpdir": tmpdir, "conf": confpath}
+        yield {"tmpdir": tmpdir, "wq": ["wq", "-F", confpath]}
 
 def test_basic():
     TO = 10
     with basic_setup() as cfg:
         PA = dict(env={**os.environ, **{"TMPDIR": cfg["tmpdir"]}})
         CA = dict(timeout=TO, **PA)
-        ps = Popen(["wq", "-F", cfg["conf"], "serve"], **PA)
-        pw = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
-        check_call(["wq", "-F", cfg["conf"], "submit", "-C", cfg["tmpdir"], "echo ok >1"], **CA)
+        ps = Popen(cfg["wq"] + ["serve"], **PA)
+        pw = Popen(cfg["wq"] + ["work"], **PA)
+        check_call(cfg["wq"] + ["submit", "-C", cfg["tmpdir"], "echo ok >1"], **CA)
         assert file_exists(os.path.join(cfg["tmpdir"], "1"), TO)
         pw.terminate(); pw.wait(TO)
         ps.terminate(); ps.wait(TO)
@@ -49,13 +49,13 @@ def test_server_restart():
     with basic_setup() as cfg:
         PA = dict(env={**os.environ, **{"TMPDIR": cfg["tmpdir"]}})
         CA = dict(timeout=TO, **PA)
-        ps = Popen(["wq", "-F", cfg["conf"], "serve"], **PA)
-        check_call(["wq", "-F", cfg["conf"], "submit", "-C", cfg["tmpdir"], "echo ok >1"], **CA)
-        check_call(["wq", "-F", cfg["conf"], "submit", "-C", cfg["tmpdir"], "echo ok >2"], **CA)
+        ps = Popen(cfg["wq"] + ["serve"], **PA)
+        check_call(cfg["wq"] + ["submit", "-C", cfg["tmpdir"], "echo ok >1"], **CA)
+        check_call(cfg["wq"] + ["submit", "-C", cfg["tmpdir"], "echo ok >2"], **CA)
         ps.terminate()
         ps.wait(TO)
-        ps = Popen(["wq", "-F", cfg["conf"], "serve"], **PA)
-        pw = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
+        ps = Popen(cfg["wq"] + ["serve"], **PA)
+        pw = Popen(cfg["wq"] + ["work"], **PA)
         assert file_exists(os.path.join(cfg["tmpdir"], "1"), TO)
         assert file_exists(os.path.join(cfg["tmpdir"], "2"), TO)
         pw.terminate(); pw.wait(TO)
@@ -66,12 +66,12 @@ def test_worker_restart():
     with basic_setup() as cfg:
         PA = dict(env={**os.environ, **{"TMPDIR": cfg["tmpdir"]}})
         CA = dict(timeout=TO, **PA)
-        ps = Popen(["wq", "-F", cfg["conf"], "serve"], **PA)
-        pw = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
+        ps = Popen(cfg["wq"] + ["serve"], **PA)
+        pw = Popen(cfg["wq"] + ["work"], **PA)
         time.sleep(2)
         pw.terminate(); pw.wait(TO)
-        pw = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
-        check_call(["wq", "-F", cfg["conf"], "submit", "-C", cfg["tmpdir"], "echo ok >1"], **CA)
+        pw = Popen(cfg["wq"] + ["work"], **PA)
+        check_call(cfg["wq"] + ["submit", "-C", cfg["tmpdir"], "echo ok >1"], **CA)
         assert file_exists(os.path.join(cfg["tmpdir"], "1"), TO)
         pw.terminate(); pw.wait(TO)
         ps.terminate(); ps.wait(TO)
@@ -81,9 +81,9 @@ def test_worker_conflict():
     with basic_setup() as cfg:
         PA = dict(env={**os.environ, **{"TMPDIR": cfg["tmpdir"]}})
         CA = dict(timeout=TO, **PA)
-        ps = Popen(["wq", "-F", cfg["conf"], "serve"], **PA)
-        pw1 = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
-        pw2 = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
+        ps = Popen(cfg["wq"] + ["serve"], **PA)
+        pw1 = Popen(cfg["wq"] + ["work"], **PA)
+        pw2 = Popen(cfg["wq"] + ["work"], **PA)
         time.sleep(2)
         assert pw1.poll() is not None or pw2.poll() is not None
 
@@ -92,12 +92,12 @@ def test_worker_replace():
     with basic_setup() as cfg:
         PA = dict(env={**os.environ, **{"TMPDIR": cfg["tmpdir"]}})
         CA = dict(timeout=TO, **PA)
-        ps = Popen(["wq", "-F", cfg["conf"], "serve"], **PA)
-        pw = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
-        check_call(["wq", "-F", cfg["conf"], "submit", "-C", cfg["tmpdir"], "sleep 8; echo ok >1"], **CA)
+        ps = Popen(cfg["wq"] + ["serve"], **PA)
+        pw = Popen(cfg["wq"] + ["work"], **PA)
+        check_call(cfg["wq"] + ["submit", "-C", cfg["tmpdir"], "sleep 8; echo ok >1"], **CA)
         time.sleep(4)
         pw.terminate(); pw.wait(TO)
-        pw = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
+        pw = Popen(cfg["wq"] + ["work"], **PA)
         assert file_exists(os.path.join(cfg["tmpdir"], "1"), TO)
         pw.terminate(); pw.wait(TO)
         ps.terminate(); ps.wait(TO)
@@ -107,13 +107,13 @@ def test_lsw():
     with basic_setup() as cfg:
         PA = dict(env={**os.environ, **{"TMPDIR": cfg["tmpdir"]}})
         CA = dict(timeout=TO, **PA)
-        ps = Popen(["wq", "-F", cfg["conf"], "serve"], **PA)
-        o1 = check_output(["wq", "-F", cfg["conf"], "lsw"], **CA)
-        pw = Popen(["wq", "-F", cfg["conf"], "work"], **PA)
+        ps = Popen(cfg["wq"] + ["serve"], **PA)
+        o1 = check_output(cfg["wq"] + ["lsw"], **CA)
+        pw = Popen(cfg["wq"] + ["work"], **PA)
         time.sleep(1)
-        o2 = check_output(["wq", "-F", cfg["conf"], "lsw"], **CA)
+        o2 = check_output(cfg["wq"] + ["lsw"], **CA)
         pw.send_signal(signal.SIGINT); pw.wait(TO)
-        o3 = check_output(["wq", "-F", cfg["conf"], "lsw"], **CA)
+        o3 = check_output(cfg["wq"] + ["lsw"], **CA)
         assert o1 != o2
         assert o2 != o3
         assert o1 == o3
