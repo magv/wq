@@ -743,6 +743,8 @@ class Resources_Disk:
         tmpdir = os.path.join(self.tmpdir, f"wq_{jobid}")
         os.mkdir(tmpdir, mode=0o700)
         popen_args["env"]["TMPDIR"] = tmpdir
+        popen_args["env"]["FORMTMP"] = tmpdir
+        popen_args["env"]["FORMTMPSORT"] = tmpdir
         return popen_args
     def units(self):
         return ("b",)
