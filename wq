@@ -124,12 +124,6 @@ def set_intersection(*sets) -> list:
         a = a.intersection(set(b))
     return sorted(a)
 
-def set_union(*sets) -> list:
-    a = set(sets[0])
-    for b in sets[1:]:
-        a = a.union(set(b))
-    return sorted(a)
-
 def count(items:typing.Iterable) -> int:
     return sum(1 for item in items if item)
 
@@ -151,12 +145,11 @@ def logf(message):
     utcdate = datetime.datetime.now(datetime.timezone.utc)
     print(utcdate.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f"), message, file=sys.stderr)
 
-def to_json(val) -> str:
+def json_encode(val) -> str:
     return msgspec.json.encode(val).decode("utf8")
 
 def json_decoder(typ:type):
-    decoder = msgspec.json.Decoder(type=typ)
-    return decoder.decode
+    return msgspec.json.Decoder(type=typ).decode
 
 # SQL (but not really) key-value database
 
@@ -164,14 +157,13 @@ class KVDBTable:
     def __init__(self, table:str, typ:type, db:"KVDB"):
         self.table = table
         self.typ = typ
-        self.encode = to_json
         self.decode = json_decoder(typ)
         self.cur = db._cur
     def __setitem__(self, key:str, value:object):
-        args = (key, self.encode(value))
+        args = (key, json_encode(value))
         self.cur.execute(f"REPLACE INTO {self.table} (key, value) VALUES (?, ?)", args)
     def setdefault(self, key:str, value:object):
-        args = (key, self.encode(value))
+        args = (key, json_encode(value))
         self.cur.execute(f"REPLACE INTO {self.table} (key, value) VALUES (?, ?)", args)
     def __getitem__(self, key:str):
         self.cur.execute(f"SELECT value FROM {self.table} WHERE key=?", (key,))
@@ -194,8 +186,7 @@ class KVDBTable:
         if not self.cur.rowcount: raise KeyError(key)
     def __iter__(self):
         self.cur.execute(f"SELECT key FROM {self.table}")
-        for row in self.cur:
-            yield row[0]
+        for row in self.cur: yield row[0]
     def keys(self):
         self.cur.execute(f"SELECT key FROM {self.table}")
         for row in self.cur: yield row[0]
@@ -204,8 +195,7 @@ class KVDBTable:
         for row in self.cur: yield (row[0], self.decode(row[1]))
     def values(self):
         self.cur.execute(f"SELECT value FROM {self.table}")
-        for row in self.cur:
-            yield self.decode(row[0])
+        for row in self.cur: yield self.decode(row[0])
 
 class KVDB:
     def __init__(self, path:str, types:dict[str,type]):
@@ -271,9 +261,8 @@ def webapi(fn):
         except msgspec.ValidationError as e:
             return web.HTTPBadRequest(reason=str(e))
         data = await fn(**body)
-        return web.json_response(data, dumps=to_json)
-    decoder = msgspec.json.Decoder(
-            type=typing.TypedDict("ARGS", typing.get_type_hints(fn))).decode
+        return web.json_response(data, dumps=json_encode)
+    decoder = json_decoder(typing.TypedDict("ARGS", typing.get_type_hints(fn)))
     return handler
 
 def has_enough_resources(available:dict[str,list[tuple[int,str,list[str]]]], requested:dict[str,tuple[int,str,list[str]]]):
@@ -1176,7 +1165,7 @@ def main():
 
     if args.cmd == "runcmd":
         main_runcmd(args.pid_path, args.status_path)
-        sys.exit(0)
+        return
 
     config = {}
     if os.path.exists(args.config):
@@ -1196,16 +1185,16 @@ def main():
     config["server"]["worker_maintenance"].setdefault("command", None)
     config["server"]["worker_maintenance"].setdefault("period", None)
 
-    try:
-        match args.cmd:
-            case "ls":      asyncio.run(main_ls(config, args.job_id))
-            case "lsw":     asyncio.run(main_lsw(config))
-            case "serve":   asyncio.run(main_serve(config, args.sleep))
-            case "submit":  asyncio.run(main_submit(config, args.name, args.script, args.directory, args.resources, args.priority))
-            case "work":    asyncio.run(main_work(config, args.sleep))
-            case _: print(__doc__, end="")
-    except KeyboardInterrupt:
-        sys.exit(1)
+    match args.cmd:
+        case "ls":      asyncio.run(main_ls(config, args.job_id))
+        case "lsw":     asyncio.run(main_lsw(config))
+        case "serve":   asyncio.run(main_serve(config, args.sleep))
+        case "submit":  asyncio.run(main_submit(config, args.name, args.script, args.directory, args.resources, args.priority))
+        case "work":    asyncio.run(main_work(config, args.sleep))
+        case _: print(__doc__, end="")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(1)
