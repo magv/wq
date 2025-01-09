@@ -69,7 +69,6 @@ import asyncio
 import contextlib
 import datetime
 import errno
-import io
 import json
 import os
 import pwd
@@ -83,7 +82,6 @@ import tempfile
 import time
 import tomllib
 import traceback
-import types
 import typing
 
 import msgspec
@@ -94,10 +92,7 @@ from aiohttp import web
 # Common utils
 
 def maybe_shorten(text:str, maxw:int) -> str:
-    if len(text) > maxw:
-        return text[:maxw-3] + "..."
-    else:
-        return text
+    return text[:maxw-3] + "..." if len(text) > maxw else text
 
 def itos(n:int) -> str:
     C = "bcdfghjklmnpqrstvwxyz"
@@ -160,7 +155,7 @@ def to_json(val) -> str:
 
 def json_decoder(typ:type):
     decoder = msgspec.json.Decoder(type=typ)
-    return lambda s: decoder.decode(s)
+    return decoder.decode
 
 # SQL (but not really) key-value database
 
@@ -217,7 +212,7 @@ class KVDB:
         self._db.executescript("PRAGMA journal_mode = wal;")
         self._db.executescript("PRAGMA synchronous = off;")
         self.tables = types
-        for name, typ in types.items():
+        for name in types.keys():
             self._db.executescript(f"""
 CREATE TABLE IF NOT EXISTS {name} (
     key TEXT UNIQUE NOT NULL,
@@ -281,9 +276,9 @@ def webapi(fn):
     return handler
 
 def has_enough_resources(available:dict[str,list[tuple[int,str,list[str]]]], requested:dict[str,tuple[int,str,list[str]]]):
-    for sys, (ramount, runit, rtags) in requested.items():
-        if sys not in available: return False
-        for aamount, aunit, atags in available[sys]:
+    for system, (ramount, runit, rtags) in requested.items():
+        if system not in available: return False
+        for aamount, aunit, atags in available[system]:
             if aunit == runit and all(f in atags for f in rtags) and aamount >= ramount:
                 break
         else:
@@ -460,14 +455,14 @@ class Server:
                     logf(f"Job {job.id!r} is taken by {worker_id!r}")
                     return {"job": job}
             await asyncio.sleep(1)
-        raise web.HTTPRequestTimeout(reason=f"no jobs")
+        raise web.HTTPRequestTimeout(reason="no jobs")
 
     async def api_job_started(self, worker_id:str, job_id:str, allocation:object):
         if worker_id not in self.workers:
             raise web.HTTPBadRequest(reason=f"bad worker id")
         worker = self.workers[worker_id]
         if job_id not in self.jobs:
-            raise web.HTTPBadRequest(reason=f"bad job id")
+            raise web.HTTPBadRequest(reason="bad job id")
         job = self.jobs[job_id]
         job.history.append(JobStatus_Started(
             date = time.time(),
@@ -501,10 +496,10 @@ class Server:
 
     async def api_finish_job(self, worker_id:str, job_id:str, exit_code:int):
         if worker_id not in self.workers:
-            raise web.HTTPBadRequest(reason=f"bad worker id")
+            raise web.HTTPBadRequest(reason="bad worker id")
         worker = self.workers[worker_id]
         if job_id not in self.jobs:
-            raise web.HTTPBadRequest(reason=f"bad job id")
+            raise web.HTTPBadRequest(reason="bad job id")
         job = self.jobs[job_id]
         job.history.append(JobStatus_Done(
             date = time.time(),
@@ -521,8 +516,8 @@ class Server:
 
     async def api_ls(self):
         return {
-            "jobs": [j for j in self.jobs.values()],
-            "workers": [w for w in self.workers.values()]
+            "jobs": list(self.jobs.values()),
+            "workers": list(self.workers.values())
         }
 
     async def api_ls_job(self, job_id:str):
@@ -532,7 +527,7 @@ class Server:
 
     async def api_lsw(self):
         return {
-            "workers": [w for w in self.workers.values()]
+            "workers": list(self.workers.values())
         }
 
 async def main_serve(config, sleep:str|None):
@@ -560,7 +555,6 @@ async def main_serve(config, sleep:str|None):
         web.post("/api/worker_config",      webapi(srv.api_worker_config)),
     ])
     async def maintenance(app):
-        srv = app["wq_server"]
         cfg = app["wq_config"]
         period = cfg["server"]["server_maintenance"]["period"]
         period = parse_seconds(period) if period else None
@@ -701,7 +695,6 @@ class Resources_Mem:
     total: int
     available: int
     def __init__(self):
-        cores = {}
         with open("/proc/meminfo", "r") as f:
             text = f.read()
         data = {}
@@ -727,7 +720,6 @@ class Resources_Disk:
     total: int
     available: int
     def __init__(self, tmpdir):
-        cores = {}
         output = subprocess.check_output(["df", tmpdir], encoding="utf-8").splitlines()
         self.tmpdir = tmpdir
         self.total = int(output[1].split()[3])*1024
@@ -753,12 +745,12 @@ class Resources_Disk:
 # Worker
 
 def meminfo() -> dict[str, str]:
-    meminfo = {}
+    info = {}
     with open("/proc/meminfo", "r") as f:
         for line in f:
             k, v = line.lower().split(":", 1)
-            meminfo[k.strip()] = v.strip()
-    return meminfo
+            info[k.strip()] = v.strip()
+    return info
 
 def read_string(path:str, default):
     try:
@@ -817,10 +809,10 @@ def forkoff(preaction, action):
             os.close(w)
             with os.fdopen(r, "r") as f:
                 return f.read()
-    except OSError as e:
-        exit(1)
+    except OSError:
+        sys.exit(1)
     # Child process
-    pid = os.setsid()
+    os.setsid()
     for fd in range(3, resource.getrlimit(resource.RLIMIT_NOFILE)[0]):
         if fd != w:
             try:
@@ -835,18 +827,18 @@ def forkoff(preaction, action):
     try:
         grandchild = os.fork()
         if grandchild > 0:
-            exit(0)
-    except OSError as e:
-        exit(1)
+            sys.exit(0)
+    except OSError:
+        sys.exit(1)
     # Grandchild process
     try:
         preaction()
         with os.fdopen(w, "w") as f:
             f.write(str(preaction()))
         action()
-        exit(0)
-    except Exception as e:
-        exit(1)
+        sys.exit(0)
+    except Exception:
+        sys.exit(1)
 
 class RunningCommand(msgspec.Struct):
     job_id:str
@@ -883,7 +875,7 @@ def start_command(job, resources):
                               allocation=allocation,
                               pid_path=pid_path,
                               status_path=status_path)
-    except Exception as e:
+    except Exception:
         for key, rsys in resources.items():
             rsys.free(allocation[key])
         raise
@@ -956,7 +948,7 @@ async def main_work(config, sleep:str|None):
         if reg["worker_id"] is None:
             if is_worker_running(reg["past_worker"]["system"]):
                 logf(f"Already running as {reg['past_worker']}")
-                exit(1)
+                sys.exit(1)
             else:
                 logf(f"Previous worker failed {reg['past_worker']}")
                 reg = await rpc("replace_worker", {
@@ -1048,7 +1040,7 @@ def main_runcmd(pid_path:str, status_path:str):
             f.write(str(rcode))
         os.rename(status_tmppath, status_path)
     res = forkoff(daemon_start, daemon_work)
-    if res != "ok": exit(1)
+    if res != "ok": sys.exit(1)
 
 # Client
 
@@ -1137,9 +1129,9 @@ async def main_submit(config, name:str|None, script:str, workdir:str, resdefs:li
         m = re.match(r"([^=.+]*)(?:[.]([^=.]*))?=([0-9]*)(.*)", spec)
         if m is None:
             raise ValueError(f"Bad resource syntax: {spec}")
-        sys, fltr, val, unit = m.groups()
+        system, fltr, val, unit = m.groups()
         # TODO: validate
-        resources[sys] = (int(val), unit or None, fltr.split("+") if fltr else [])
+        resources[system] = (int(val), unit or None, fltr.split("+") if fltr else [])
     resources.setdefault("cpu", (1, "cpu", []))
     resources.setdefault("mem", (1024**3, "b", []))
     resources.setdefault("tmp", (1024**3, "b", []))
@@ -1154,8 +1146,7 @@ async def main_submit(config, name:str|None, script:str, workdir:str, resdefs:li
         })
         print(jobdata)
 
-if __name__ == "__main__":
-
+def main():
     homedir = os.environ["HOME"]
     confdir = os.environ.get("XDG_CONFIG_HOME", os.path.join(homedir, ".config"))
     datadir = os.environ.get("XDG_DATA_HOME", os.path.join(homedir, ".local", "share"))
@@ -1184,7 +1175,7 @@ if __name__ == "__main__":
 
     if args.cmd == "runcmd":
         main_runcmd(args.pid_path, args.status_path)
-        exit(0)
+        sys.exit(0)
 
     config = {}
     if os.path.exists(args.config):
@@ -1213,4 +1204,7 @@ if __name__ == "__main__":
             case "work":    asyncio.run(main_work(config, args.sleep))
             case _: print(__doc__, end="")
     except KeyboardInterrupt:
-        exit(1)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
