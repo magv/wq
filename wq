@@ -144,7 +144,8 @@ def print_table(rows, indent="", separator="  "):
         if len(row) == 0:
             print(indent + separator.join("-"*w for w in colw))
         else:
-            print(indent + separator.join(cell.ljust(colw[i]) for i, cell in enumerate(row)).rstrip())
+            print(indent + separator.join(cell.ljust(colw[i])
+                                          for i, cell in enumerate(row)).rstrip())
 
 def logf(message):
     utcdate = datetime.datetime.now(datetime.timezone.utc)
@@ -1086,7 +1087,7 @@ async def main_ls(config, job_id):
     async with RPC(config) as rpc:
         o = await rpc("ls")
         jobs = o["jobs"]
-        table = [["id", "prio", "w", "s", "dir", "command"]]
+        table = [["id", "prio", "w", "s", "dir", "command"], []]
         for j in jobs:
             status = j["history"][-1]
             match status["status"]:
@@ -1121,7 +1122,7 @@ async def main_lsw(config):
         for w in o["workers"]:
             table.append([w["id"], w["system"]["hostname"], len(w["taken_jobs"]), w["stats"]["loadavg"]])
         table.sort(key=lambda row: row[1])
-        print_table([["id", "hostname", "jobs", "load"]] + table)
+        print_table([["id", "hostname", "jobs", "load"], []] + table)
 
 async def main_submit(config, name:str|None, script:str, workdir:str, resdefs:list[str], prio:int):
     resources = {}
