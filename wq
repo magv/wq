@@ -681,6 +681,24 @@ def parse_seconds(duration:str) -> float:
         "": 1, "s": 1, "m": 60, "h": 60*60, "d": 24*60*60, "w": 7*24*60*60
     })
 
+def format_quantity(value:float, units:list[tuple[float, str, float]]) -> str:
+    for unit, name, maxval in units:
+        v = value/unit
+        if v > maxval: continue
+        if v < 9.9: return f"{v:.1f} {name}"
+        return f"{v:.0f} {name}"
+    return f"{v:.0f} {name}"
+
+def format_time(value:float) -> str:
+    return format_quantity(value, (
+        (1, "s", 90),
+        (60, "m", 90),
+        (60*60, "h", 48),
+        (24*60*60, "d", 14),
+        (7*24*60*60, "w", 50),
+        (365*24*60*60, "y", 0)
+    ))
+
 class Resources_Mem:
     total: int
     available: int
@@ -1075,7 +1093,7 @@ async def main_ls(config, job_id):
     async with RPC(config) as rpc:
         o = await rpc("ls")
         jobs = o["jobs"]
-        table = [["id", "prio", "w", "s", "dir", "command"], []]
+        table = [["id", "prio", "w", "s", "when", "dir", "command"], []]
         for j in jobs:
             status = j["history"][-1]
             match status["status"]:
@@ -1098,6 +1116,7 @@ async def main_ls(config, job_id):
                 j["priority"],
                 W,
                 S,
+                format_time(time.time() - status["date"]) + " ago",
                 j["workdir"],
                 maybe_shorten(j["command"], 50)
         ])
