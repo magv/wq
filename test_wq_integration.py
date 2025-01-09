@@ -61,6 +61,19 @@ def test_server_restart():
         pw.terminate(); pw.wait(TO)
         ps.terminate(); ps.wait(TO)
 
+def test_server_late():
+    TO = 10
+    with basic_setup() as cfg:
+        PA = dict(env={**os.environ, **{"TMPDIR": cfg["tmpdir"]}})
+        pc = Popen(cfg["wq"] + ["submit", "-C", cfg["tmpdir"], "echo ok >1"], **PA)
+        pw = Popen(cfg["wq"] + ["work"], **PA)
+        time.sleep(1)
+        ps = Popen(cfg["wq"] + ["serve"], **PA)
+        pc.wait(TO)
+        assert file_exists(os.path.join(cfg["tmpdir"], "1"), TO)
+        pw.terminate(); pw.wait(TO)
+        ps.terminate(); ps.wait(TO)
+
 def test_worker_restart():
     TO = 10
     with basic_setup() as cfg:
@@ -80,7 +93,6 @@ def test_worker_conflict():
     TO = 10
     with basic_setup() as cfg:
         PA = dict(env={**os.environ, **{"TMPDIR": cfg["tmpdir"]}})
-        CA = dict(timeout=TO, **PA)
         ps = Popen(cfg["wq"] + ["serve"], **PA)
         pw1 = Popen(cfg["wq"] + ["work"], **PA)
         pw2 = Popen(cfg["wq"] + ["work"], **PA)
