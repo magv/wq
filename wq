@@ -324,7 +324,7 @@ class Server:
             if id not in self.jobs: break
         job = Job(id=id, name=name, command=command, workdir=workdir, environment=environment, resources=resources, priority=priority, history=[JobStatus_Added(date=time.time())])
         self.jobs[job.id] = job
-        self.kvdb.sync()
+        self.sync()
         logf(f"New job {job.id!r}: {maybe_shorten(command, 40)!r}")
         return {"job_id": job.id}
 
@@ -349,7 +349,7 @@ class Server:
                     taken_jobs=[])
         self.workers[worker.id] = worker
         self.node2worker[worker.node] = worker.id
-        self.kvdb.sync()
+        self.sync()
         logf(f"Worker {worker.id!r} (node {node!r}) started on {system!r}")
         return {"worker_id": worker.id}
 
@@ -384,7 +384,7 @@ class Server:
         # Record new worker
         self.workers[worker.id] = worker
         self.node2worker[worker.node] = worker.id
-        self.kvdb.sync()
+        self.sync()
         logf(f"Worker {worker.id!r} (node {worker.node!r}) took over from {past_worker.id!r} on {system!r}")
         return {"worker_id": worker.id, "job_ids": worker.taken_jobs}
 
@@ -395,7 +395,7 @@ class Server:
         worker.last_seen = time.time()
         worker.stats = stats
         self.workers[worker.id] = worker
-        self.kvdb.sync()
+        self.sync()
         return {}
 
     async def api_worker_config(self, worker_id:str):
@@ -403,7 +403,7 @@ class Server:
             raise web.HTTPBadRequest(reason=f"bad worker id")
         #worker = self.workers[worker_id]
         return {
-            "maintenance_period":  self.worker_maintenance_period,
+            "maintenance_period": self.worker_maintenance_period,
             "maintenance_command": self.worker_maintenance_command
         }
 
@@ -415,7 +415,7 @@ class Server:
             self.inactive_workers[worker_id] = worker
             del self.workers[worker_id]
             del self.node2worker[worker.node]
-            self.kvdb.sync()
+            self.sync()
             logf(f"Worker {worker_id!r} has exited")
         else:
             logf(f"Worker {worker_id!r} has exited, but still has jobs")
@@ -429,7 +429,7 @@ class Server:
         worker.last_seen = now
         worker.stats = stats
         self.workers[worker.id] = worker
-        self.kvdb.sync()
+        self.sync()
         for repeat in range(2):
             for job in self.jobs.values():
                 if not isinstance(job.history[-1], JobStatus_Added): continue
@@ -441,7 +441,7 @@ class Server:
                     worker.taken_jobs.append(job.id)
                     self.jobs[job.id] = job
                     self.workers[worker.id] = worker
-                    self.kvdb.sync()
+                    self.sync()
                     logf(f"Job {job.id!r} is taken by {worker_id!r}")
                     return {"job": job}
             await asyncio.sleep(1)
@@ -460,7 +460,7 @@ class Server:
             res = allocation
         ))
         self.jobs[job.id] = job
-        self.kvdb.sync()
+        self.sync()
         logf(f"Job {job.id!r} is started by {worker.id!r}, res {allocation}")
         return {}
 
@@ -480,7 +480,7 @@ class Server:
         worker.taken_jobs.remove(job.id)
         self.jobs[job.id] = job
         self.workers[worker.id] = worker
-        self.kvdb.sync()
+        self.sync()
         logf(f"Job {job.id!r} is cancelled by {worker.id!r} because: {reason!r}")
         return {}
 
@@ -500,7 +500,7 @@ class Server:
         worker.taken_jobs.remove(job.id)
         self.jobs[job.id] = job
         self.workers[worker.id] = worker
-        self.kvdb.sync()
+        self.sync()
         logf(f"Job {job.id!r} is finished by {worker.id!r}, exit code {exit_code}")
         return {}
 
@@ -951,7 +951,6 @@ async def main_work(config, sleep:str|None):
                     cmd = take_over_command(job_id)
                     commands.append(cmd)
         conf = await rpc("worker_config", {"worker_id": reg["worker_id"]})
-
         try:
             while True:
                 # Maintenance, if needed
