@@ -249,7 +249,7 @@ class JobStatus_Common(msgspec.Struct,
     date: float
 class JobStatus_Added(JobStatus_Common): pass
 class JobStatus_Taken(JobStatus_Common): worker_id: str
-class JobStatus_Started(JobStatus_Common): worker_id: str; pid: int; res: object
+class JobStatus_Started(JobStatus_Common): worker_id: str; res: object
 class JobStatus_Reassigned(JobStatus_Common): worker_id: str
 class JobStatus_Stopped(JobStatus_Common): worker_id: str; reason: str
 class JobStatus_Done(JobStatus_Common): worker_id: str; exit_code: int
@@ -462,7 +462,7 @@ class Server:
             await asyncio.sleep(1)
         raise web.HTTPRequestTimeout(reason=f"no jobs")
 
-    async def api_job_started(self, worker_id:str, job_id:str, pid:int, allocation:object):
+    async def api_job_started(self, worker_id:str, job_id:str, allocation:object):
         if worker_id not in self.workers:
             raise web.HTTPBadRequest(reason=f"bad worker id")
         worker = self.workers[worker_id]
@@ -472,12 +472,11 @@ class Server:
         job.history.append(JobStatus_Started(
             date = time.time(),
             worker_id = worker.id,
-            pid = pid,
             res = allocation
         ))
         self.jobs[job.id] = job
         self.kvdb.sync()
-        logf(f"Job {job.id!r} is started by {worker.id!r}, pid {pid}, res {allocation}")
+        logf(f"Job {job.id!r} is started by {worker.id!r}, res {allocation}")
         return {}
 
     async def api_cancel_job(self, worker_id:str, job_id:str, reason:str):
@@ -1013,7 +1012,6 @@ async def main_work(config, sleep:str|None):
                         await rpc("job_started", {
                             "worker_id": reg["worker_id"],
                             "job_id": cmd.job_id,
-                            "pid": 999,
                             "allocation": cmd.allocation
                         })
                 # Poll running commands
