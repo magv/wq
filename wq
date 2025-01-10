@@ -620,7 +620,7 @@ class Resources_CPU:
         self.processors = sorted(processors, key=lambda p: p.index)
     def units(self):
         return ("cpu", "core", "socket", "node")
-    def reserve(self, count:int, unit:str, fltr:list[str]) -> list[int]:
+    def allocate(self, count:int, unit:str, fltr:list[str]) -> list[int]:
         cpus = [p for p in self.processors
                 if p.allowed and p.free and tags_match(p.tags, fltr)]
         match unit:
@@ -629,8 +629,10 @@ class Resources_CPU:
             #case "socket": TODO
             case "node": pass
             case _: raise ValueError(f"Unknown CPU unit {unit!r}")
-        for p in cpus: p.free = False
         return [p.index for p in cpus]
+    def reserve(self, allocation:list[int]) -> None:
+        for idx in allocation:
+            self.processors[idx].free = False
     def free(self, allocation:list[int]) -> None:
         for idx in allocation:
             self.processors[idx].free = True
@@ -711,9 +713,11 @@ class Resources_Mem:
             data[k.strip()] = v.strip()
         self.total = parse_bytes(data["memavailable"])
         self.available = self.total
-    def reserve(self, count:int, unit:str, fltr:str) -> int:
+    def allocate(self, count:int, unit:str, fltr:str) -> int:
         assert unit == "b"
         return count
+    def reserve(self, allocation:int) -> None:
+        self.available -= allocation
     def free(self, allocation:int) -> None:
         self.available += allocation
     def restrict(self, allocation, popen_args):
@@ -732,9 +736,11 @@ class Resources_Disk:
         self.tmpdir = tmpdir
         self.total = int(output[1].split()[3])*1024
         self.available = self.total
-    def reserve(self, count:int, unit:str, fltr:str) -> int:
+    def allocate(self, count:int, unit:str, fltr:str) -> int:
         assert unit == "b"
         return count
+    def reserve(self, allocation:int) -> None:
+        self.available -= allocation
     def free(self, allocation:int) -> None:
         self.available += allocation
     def restrict(self, allocation, popen_args):
@@ -863,7 +869,8 @@ def start_command(job, resources):
     }
     allocation = {}
     for key, rsys in resources.items():
-        alloc = rsys.reserve(*job["resources"].get(key, (0, None, None)))
+        alloc = rsys.allocate(*job["resources"].get(key, (0, None, None)))
+        rsys.reserve(alloc)
         popen_args = rsys.restrict(alloc, popen_args)
         allocation[key] = alloc
     tmpdir = popen_args["env"]["TMPDIR"]
@@ -891,7 +898,7 @@ def start_command(job, resources):
             rsys.free(allocation[key])
         raise
 
-def take_over_command(job_id):
+def take_over_command(job_id, resources):
     tmpdir = os.environ.get("TMPDIR", "/tmp")
     tmpdir = os.path.join(tmpdir, f"wq_{job_id}")
     pid_path = os.path.join(tmpdir, job_id + ".wqpid")
@@ -899,6 +906,8 @@ def take_over_command(job_id):
     status_path = os.path.join(tmpdir, job_id + ".wqstatus")
     with open(alloc_path, "rb") as f:
         allocation = msgspec.json.decode(f.read())
+    for key, rsys in resources.items():
+        rsys.reserve(allocation[key])
     return RunningCommand(job_id=job_id,
                           allocation=allocation,
                           pid_path=pid_path,
@@ -969,7 +978,7 @@ async def main_work(config, sleep:str|None):
                     "stats": system_stats()
                 })
                 for job_id in reg["job_ids"]:
-                    cmd = take_over_command(job_id)
+                    cmd = take_over_command(job_id, resources)
                     commands.append(cmd)
         conf = await rpc("worker_config", {"worker_id": reg["worker_id"]})
         try:
