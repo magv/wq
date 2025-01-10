@@ -1172,7 +1172,7 @@ async def main_submit(config, name:str|None, script:str, workdir:str, resdefs:li
         })
         print(jobdata)
 
-def main():
+def real_main():
     homedir = os.environ["HOME"]
     confdir = os.environ.get("XDG_CONFIG_HOME", os.path.join(homedir, ".config"))
     datadir = os.environ.get("XDG_DATA_HOME", os.path.join(homedir, ".local", "share"))
@@ -1229,8 +1229,11 @@ def main():
         case "work":    asyncio.run(main_work(config, args.sleep))
         case _: print(__doc__, end="")
 
-if __name__ == "__main__":
+def main():
     try:
-        main()
+        real_main()
     except KeyboardInterrupt:
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()
