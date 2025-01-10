@@ -1,6 +1,6 @@
 ## What?
 
-Wq is a job scheduler for poor people with no root access.
+Wq is a Linux job scheduler for poor people with no root access.
 
 ## Why?
 
@@ -15,12 +15,51 @@ run it there*”?
 
 Your takeaway? They need a job scheduling system.
 
-The question then is: which is faster, to convince them to set
-up [slurm] or [htcondor] for everyone, or to hack around it
-yourself? You now must ponder no more, because to hack around
-it is as easy as
+But which is faster, to convince them to set up [slurm] or
+[htcondor] for everyone, or to hack around it yourself? Ponder
+no more, friends, because now you can just
 
     python3 -m pip install --user git+https://github.com/magv/wq
 
-[slurm]: https://slurm.schedmd.com/quickstart.html
 [htcondor]: https://htcondor.org/htcondor/overview/
+[slurm]: https://slurm.schedmd.com/quickstart.html
+
+## How to setup?
+
+- Make sure you have [python] version 3.10 or newer. Compile it
+  by hand, if you must, or use [pyenv], [spack], etc.
+
+- Make sure your python has a recent version of [pip] installed.
+  Upgrade it, if you must:
+
+      python3 -m pip install --upgrade --user pip
+
+- Install wq:
+
+      python3 -m pip install --user git+https://github.com/magv/wq
+
+- Figure out which machine you want to use a server, and put its
+  IP address into the config file at `~/.config/wq.conf`:
+
+      [client]
+      server_url = "http://SERVER-IP-HERE:23024"
+
+      [server]
+      host = "SERVER-IP-HERE"
+      port = 23024
+
+  The port can also be chosen freely.
+
+- Run `wq serve` on the server in a [tmux] or a [screen] session.
+
+- Run `wq work` on each worker machine in a [tmux] or a [screen]
+  session.
+
+- Use `wq submit "command"` to submit your jobs.
+
+[pip]: https://pip.pypa.io/
+[pyenv]: https://github.com/pyenv/pyenv
+[python]: https://www.python.org/
+[spack]: https://spack.io/
+[tmux]: https://github.com/tmux/tmux/
+[screen]: https://www.gnu.org/software/screen/
