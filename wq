@@ -858,7 +858,6 @@ def start_command(job, resources):
     env = job["environment"].copy()
     env["WQ_JOBID"] = job["id"]
     popen_args = {
-        "args": ["/usr/bin/time", "/bin/sh", "-c", job["command"]],
         "cwd": job["workdir"],
         "env": env
     }
@@ -871,8 +870,12 @@ def start_command(job, resources):
     pid_path = os.path.join(tmpdir, job["id"] + ".wqpid")
     alloc_path = os.path.join(tmpdir, job["id"] + ".wqalloc")
     status_path = os.path.join(tmpdir, job["id"] + ".wqstatus")
+    script_path = os.path.join(tmpdir, job["id"] + ".sh")
     with open(alloc_path, "wb") as f:
         f.write(msgspec.json.encode(allocation))
+    with open(script_path, "w") as f:
+        f.write(job["command"])
+    popen_args["args"] = ["/bin/sh", script_path]
     try:
         proc = subprocess.run(
                 ["wq", "runcmd", pid_path, status_path],
