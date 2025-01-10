@@ -75,6 +75,7 @@ import pwd
 import random
 import re
 import resource
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -620,7 +621,7 @@ class Resources_CPU:
         self.processors = sorted(processors, key=lambda p: p.index)
     def units(self):
         return ("cpu", "core", "socket", "node")
-    def allocate(self, count:int, unit:str, fltr:list[str]) -> list[int]:
+    def allocate(self, jobid:str, count:int, unit:str, fltr:list[str]) -> list[int]:
         cpus = [p for p in self.processors
                 if p.allowed and p.free and tags_match(p.tags, fltr)]
         match unit:
@@ -713,7 +714,7 @@ class Resources_Mem:
             data[k.strip()] = v.strip()
         self.total = parse_bytes(data["memavailable"])
         self.available = self.total
-    def allocate(self, count:int, unit:str, fltr:str) -> int:
+    def allocate(self, jobid:str, count:int, unit:str, fltr:str) -> int:
         assert unit == "b"
         return count
     def reserve(self, allocation:int) -> None:
@@ -736,17 +737,20 @@ class Resources_Disk:
         self.tmpdir = tmpdir
         self.total = int(output[1].split()[3])*1024
         self.available = self.total
-    def allocate(self, count:int, unit:str, fltr:str) -> int:
+    def allocate(self, jobid:str, count:int, unit:str, fltr:str) -> tuple[int, str]:
         assert unit == "b"
-        return count
-    def reserve(self, allocation:int) -> None:
-        self.available -= allocation
-    def free(self, allocation:int) -> None:
-        self.available += allocation
-    def restrict(self, allocation, popen_args):
-        jobid = popen_args["env"]["WQ_JOBID"]
         tmpdir = os.path.join(self.tmpdir, f"wq_{jobid}")
         os.mkdir(tmpdir, mode=0o700)
+        return (count, tmpdir)
+    def reserve(self, allocation:tuple[int, str]) -> None:
+        size, tmpdir = allocation
+        self.available -= size
+    def free(self, allocation:tuple[int, str]) -> None:
+        size, tmpdir = allocation
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        self.available += size
+    def restrict(self, allocation:tuple[int, str], popen_args):
+        size, tmpdir = allocation
         popen_args["env"]["TMPDIR"] = tmpdir
         popen_args["env"]["FORMTMP"] = tmpdir
         popen_args["env"]["FORMTMPSORT"] = tmpdir
@@ -869,7 +873,7 @@ def start_command(job, resources):
     }
     allocation = {}
     for key, rsys in resources.items():
-        alloc = rsys.allocate(*job["resources"].get(key, (0, None, None)))
+        alloc = rsys.allocate(job["id"], *job["resources"].get(key, (0, None, None)))
         rsys.reserve(alloc)
         popen_args = rsys.restrict(alloc, popen_args)
         allocation[key] = alloc
@@ -1031,13 +1035,13 @@ async def main_work(config, sleep:str|None):
                         with open(cmd.status_path, "r") as f:
                             rc = int(f.read())
                         logf(f"Command {cmd} is done, exit code: {rc}")
-                        finalize_command(cmd, resources)
-                        commands.pop(i)
                         await rpc("finish_job", {
                             "worker_id": reg["worker_id"],
                             "job_id": cmd.job_id,
                             "exit_code": rc
                         })
+                        finalize_command(cmd, resources)
+                        commands.pop(i)
                 await asyncio.sleep(0.8 + 0.4*random.random())
         finally:
             await rpc("unregister_worker", {"worker_id": reg["worker_id"]})
