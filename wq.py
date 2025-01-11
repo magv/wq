@@ -28,16 +28,15 @@ COMMANDS
     wq lsw
         List workers.
 
-    wq work [-S sleep]
+    wq work
         Start or restart the worker on the current machine.
 
-    wq serve [-S sleep]
+    wq serve
         Start a server.
 
 OPTIONS
     -h          show a help message and exit
     -F config   use this configuration file
-    -S sleep    sleep this much time before working
     -r resources
 
 CONFIGURATION
@@ -51,14 +50,6 @@ CONFIGURATION
         host = "127.0.0.1"
         port = 8080
         database = "~/.local/share/wqserver.db"
-
-        [server.server_maintenance]
-        #period = ""
-        #command = ""
-
-        [server.worker_maintenance]
-        #period = ""
-        #command = ""
 
 ENVIRONMENT
     TMPDIR      Temporary files will be created here.
@@ -284,8 +275,6 @@ class Server:
     jobs: dict[str, Job]
     node2worker: dict[str, str]
     kvdb: KVDB
-    worker_maintenance_period: float|None
-    worker_maintenance_command: str|None
     def __init__(self, config:dict):#db_path m_period, m_command):
         db_path = config["database"]
         logf(f"Opening database {db_path!r}")
@@ -301,9 +290,6 @@ class Server:
         self.node2worker = self.kvdb.table("node2worker")
         self.worker_index = 0
         self.job_index = 0
-        period = config["worker_maintenance"]["period"]
-        self.worker_maintenance_period = parse_seconds(period) if period else None
-        self.worker_maintenance_command = config["worker_maintenance"]["command"]
         logf(f"Got {len(self.jobs)} jobs, "
             f"{len(self.workers)} active workers, "
             f"{len(self.inactive_workers)} inactive workers")
@@ -398,15 +384,6 @@ class Server:
         self.workers[worker.id] = worker
         self.sync()
         return {}
-
-    async def api_worker_config(self, worker_id:str):
-        if worker_id not in self.workers:
-            raise web.HTTPBadRequest(reason=f"bad worker id")
-        #worker = self.workers[worker_id]
-        return {
-            "maintenance_period": self.worker_maintenance_period,
-            "maintenance_command": self.worker_maintenance_command
-        }
 
     async def api_unregister_worker(self, worker_id:str):
         if worker_id not in self.workers:
@@ -521,11 +498,8 @@ class Server:
             "workers": list(self.workers.values())
         }
 
-async def main_serve(config, sleep:str|None):
+async def main_serve(config):
     srv = Server(config["server"])
-    if sleep is not None:
-        duration = parse_seconds(sleep)
-        await asyncio.sleep(duration*(0.8 + 0.4*random.random()))
     app = web.Application()
     app["wq_server"] = srv
     app["wq_config"] = config
@@ -543,35 +517,7 @@ async def main_serve(config, sleep:str|None):
         web.post("/api/take_job",           webapi(srv.api_take_job)),
         web.post("/api/unregister_worker",  webapi(srv.api_unregister_worker)),
         web.post("/api/update_worker",      webapi(srv.api_update_worker)),
-        web.post("/api/worker_config",      webapi(srv.api_worker_config)),
     ])
-    async def maintenance(app):
-        cfg = app["wq_config"]
-        period = cfg["server"]["server_maintenance"]["period"]
-        period = parse_seconds(period) if period else None
-        command = cfg["server"]["server_maintenance"]["command"]
-        if period and command:
-            while True:
-                logf("Starting server maintenance script")
-                try:
-                    with tempfile.NamedTemporaryFile("w", suffix=".sh", encoding="utf-8") as f:
-                        f.write(command)
-                        f.flush()
-                        proc = await asyncio.create_subprocess_exec(
-                            "/bin/sh", f.name,
-                            stdin=asyncio.subprocess.DEVNULL)
-                        rc = await proc.wait()
-                    logf(f"Server maintenance finished with code {rc}, will repeat in {period}s")
-                except Exception as e:
-                    logf(f"Server maintenance failed: {e}, will repeat in {period}s")
-                await asyncio.sleep(period*(0.8 + 0.4*random.random()))
-    async def background_tasks(app):
-        task = asyncio.create_task(maintenance(app))
-        yield
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    app.cleanup_ctx.append(background_tasks)
     await web._run_app(app, host=config["server"]["host"], port=config["server"]["port"])
 
 # Worker Resources
@@ -949,10 +895,7 @@ class RPC:
             await asyncio.sleep(timeout*(0.8 + 0.4*random.random()))
             timeout = min(RPC_MAXSLEEP, timeout*2)
 
-async def main_work(config, sleep:str|None):
-    if sleep is not None:
-        duration = parse_seconds(sleep)
-        await asyncio.sleep(duration*(0.8 + 0.4*random.random()))
+async def main_work(config):
     tmpdir = os.environ.get("TMPDIR", "/tmp")
     resources = {
         "cpu": Resources_CPU(),
@@ -960,7 +903,6 @@ async def main_work(config, sleep:str|None):
         "tmp": Resources_Disk(tmpdir)
     }
     commands:list[RunningCommand] = []
-    last_maintenance = None
     async with RPC(config) as rpc:
         si = system_info()
         reg = await rpc("register_worker", {
@@ -984,26 +926,8 @@ async def main_work(config, sleep:str|None):
                 for job_id in reg["job_ids"]:
                     cmd = take_over_command(job_id, resources)
                     commands.append(cmd)
-        conf = await rpc("worker_config", {"worker_id": reg["worker_id"]})
         try:
             while True:
-                # Maintenance, if needed
-                period = conf["maintenance_period"]
-                if period is not None:
-                    if last_maintenance is None or last_maintenance <= time.time() - period:
-                        logf("Starting maintenance script")
-                        try:
-                            with tempfile.NamedTemporaryFile("w", suffix=".sh", encoding="utf-8") as f:
-                                f.write(conf["maintenance_command"])
-                                f.flush()
-                                proc = await asyncio.create_subprocess_exec(
-                                    "/bin/sh", f.name,
-                                    stdin=asyncio.subprocess.DEVNULL)
-                                rc = await proc.wait()
-                            logf(f"Maintenance finished with code {rc}, will repeat in {period}s")
-                        except Exception as e:
-                            logf(f"Maintenance failed: {e}, will repeat in {period}s")
-                        last_maintenance = time.time()
                 # Get some work from the server
                 resp = await rpc("take_job", {
                         "worker_id": reg["worker_id"],
@@ -1186,12 +1110,10 @@ def real_main():
     parser.add_argument("-F", "--config", action="store", default=os.path.join(confdir, "wq.toml"), metavar="file")
     parser_cmd = parser.add_subparsers(dest="cmd")
     p = parser_cmd.add_parser("serve")
-    p.add_argument("-S", "--sleep", action="store", default=None)
     p = parser_cmd.add_parser("ls")
     p.add_argument("job_id", action="store", default=None, nargs="?")
     p = parser_cmd.add_parser("lsw")
     p = parser_cmd.add_parser("work")
-    p.add_argument("-S", "--sleep", action="store", default=None)
     p = parser_cmd.add_parser("submit")
     p.add_argument("script")
     p.add_argument("-C", "--directory", action="store", default=os.getcwd())
@@ -1218,19 +1140,13 @@ def real_main():
     config["server"].setdefault("database", os.path.join(datadir, "wqserver.db"))
     config["server"].setdefault("host", "127.0.0.1")
     config["server"].setdefault("port", 8080)
-    config["server"].setdefault("server_maintenance", {})
-    config["server"].setdefault("worker_maintenance", {})
-    config["server"]["server_maintenance"].setdefault("command", None)
-    config["server"]["server_maintenance"].setdefault("period", None)
-    config["server"]["worker_maintenance"].setdefault("command", None)
-    config["server"]["worker_maintenance"].setdefault("period", None)
 
     match args.cmd:
         case "ls":      asyncio.run(main_ls(config, args.job_id))
         case "lsw":     asyncio.run(main_lsw(config))
-        case "serve":   asyncio.run(main_serve(config, args.sleep))
+        case "serve":   asyncio.run(main_serve(config))
         case "submit":  asyncio.run(main_submit(config, args.name, args.script, args.directory, args.resources, args.priority))
-        case "work":    asyncio.run(main_work(config, args.sleep))
+        case "work":    asyncio.run(main_work(config))
         case _: print(__doc__, end="")
 
 def main():
