@@ -38,8 +38,8 @@ no more, friends, because now you can just
 
       python3 -m pip install --user git+https://github.com/magv/wq
 
-- Figure out which machine you want to use a server, and put its
-  IP address into the config file at `~/.config/wq.conf`:
+- Figure out which machine you want to use as a server, and put
+  its IP address into the config file at `~/.config/wq.conf`:
 
       [client]
       server_url = "http://SERVER-IP-HERE:23024"
