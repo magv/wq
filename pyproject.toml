@@ -1,7 +1,6 @@
 [project]
 name = "wq"
 description = "A single-user job scheduling system"
-version = "0.1"
 authors = [{name = "Vitaly Magerya"}]
 readme = "README.md"
 requires-python = "~= 3.10"
@@ -16,6 +15,7 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Topic :: System :: Clustering"
 ]
+dynamic = ["version"]
 
 [project.scripts]
 wq = "wq:main"
@@ -30,8 +30,14 @@ test = [
 ]
 
 [build-system]
-requires = ["flit_core ~= 3.7"]
-build-backend = "flit_core.buildapi"
+requires = ["pdm-backend ~= 2.4.3"]
+build-backend = "pdm.backend"
 
-[tool.flit.external-data]
-directory = "data"
+[tool.pdm.build]
+includes = ["wq.py", "data/**/*"]
+
+[tool.pdm.build.wheel-data]
+data = [{path = "data/**/*", relative-to = "data"}]
+
+[tool.pdm.version]
+source = "scm"
