@@ -27,7 +27,8 @@ no more, friends, because now you can just
 ## How to setup?
 
 - Make sure you have [python] version 3.10 or newer. Compile it
-  by hand, if you must, or use [pyenv], [spack], etc.
+  by hand, if you must, or use [uv], [pyenv], [spack], etc, if
+  that’s easier.
 
 - Make sure your python has a recent version of [pip] installed.
   Upgrade it, if you must:
@@ -62,4 +63,5 @@ no more, friends, because now you can just
 [python]: https://www.python.org/
 [spack]: https://spack.io/
 [tmux]: https://github.com/tmux/tmux/
+[uv]: https://github.com/astral-sh/uv
 [screen]: https://www.gnu.org/software/screen/

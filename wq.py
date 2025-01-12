@@ -44,11 +44,11 @@ CONFIGURATION
     The configuration is stored in ~/.config/wq.toml, by default it is:
 
         [client]
-        server_url = "http://127.0.0.1:8080"
+        server_url = "http://127.0.0.1:23024"
 
         [server]
         host = "127.0.0.1"
-        port = 8080
+        port = 23024
         database = "~/.local/share/wqserver.db"
 
 ENVIRONMENT
@@ -133,7 +133,7 @@ def print_table(rows, indent="", separator="  "):
             print(indent + separator.join(cell.ljust(colw[i])
                                           for i, cell in enumerate(row)).rstrip())
 
-def logf(message):
+def logf(message:str):
     utcdate = datetime.datetime.now(datetime.timezone.utc)
     print(utcdate.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f"), message, file=sys.stderr)
 
@@ -152,9 +152,6 @@ class KVDBTable:
         self.decode = json_decoder(typ)
         self.cur = db._cur
     def __setitem__(self, key:str, value:object):
-        args = (key, json_encode(value))
-        self.cur.execute(f"REPLACE INTO {self.table} (key, value) VALUES (?, ?)", args)
-    def setdefault(self, key:str, value:object):
         args = (key, json_encode(value))
         self.cur.execute(f"REPLACE INTO {self.table} (key, value) VALUES (?, ?)", args)
     def __getitem__(self, key:str):
@@ -449,12 +446,13 @@ class Server:
         if job_id not in self.jobs:
             raise web.HTTPBadRequest(reason=f"bad job id")
         job = self.jobs[job_id]
+        now = time.time()
         job.history.append(JobStatus_Stopped(
-            date = time.time(),
+            date = now,
             worker_id = worker.id,
             reason = reason
         ))
-        worker.last_seen = time.time()
+        worker.last_seen = now
         worker.taken_jobs.remove(job.id)
         self.jobs[job.id] = job
         self.workers[worker.id] = worker
@@ -469,12 +467,13 @@ class Server:
         if job_id not in self.jobs:
             raise web.HTTPBadRequest(reason="bad job id")
         job = self.jobs[job_id]
+        now = time.time()
         job.history.append(JobStatus_Done(
-            date = time.time(),
+            date = now,
             worker_id = worker.id,
             exit_code = exit_code
         ))
-        worker.last_seen = time.time()
+        worker.last_seen = now
         worker.taken_jobs.remove(job.id)
         self.jobs[job.id] = job
         self.workers[worker.id] = worker
@@ -652,13 +651,8 @@ class Resources_Mem:
     total: int
     available: int
     def __init__(self):
-        with open("/proc/meminfo", "r") as f:
-            text = f.read()
-        data = {}
-        for line in text.splitlines():
-            k, v = line.lower().split(":", 1)
-            data[k.strip()] = v.strip()
-        self.total = parse_bytes(data["memavailable"])
+        mi = meminfo()
+        self.total = parse_bytes(mi["memavailable"])
         self.available = self.total
     def allocate(self, jobid:str, count:int, unit:str, fltr:str) -> int:
         assert unit == "b"
@@ -750,7 +744,6 @@ def is_worker_running(sysinfo:dict) -> bool:
             return False
     comm = read_string(f"/proc/{pid}/comm", None)
     cmdline = read_string(f"/proc/{pid}/cmdline", None)
-    print(comm, sysinfo["comm"])
     return comm == sysinfo["comm"] and cmdline == sysinfo["cmdline"]
 
 def system_stats() -> dict:
@@ -818,22 +811,22 @@ def start_command(job, resources):
         "env": env
     }
     allocation = {}
-    for key, rsys in resources.items():
-        alloc = rsys.allocate(job["id"], *job["resources"].get(key, (0, None, None)))
-        rsys.reserve(alloc)
-        popen_args = rsys.restrict(alloc, popen_args)
-        allocation[key] = alloc
-    tmpdir = popen_args["env"]["TMPDIR"]
-    pid_path = os.path.join(tmpdir, job["id"] + ".wqpid")
-    alloc_path = os.path.join(tmpdir, job["id"] + ".wqalloc")
-    status_path = os.path.join(tmpdir, job["id"] + ".wqstatus")
-    script_path = os.path.join(tmpdir, job["id"] + ".sh")
-    with open(alloc_path, "wb") as f:
-        f.write(msgspec.json.encode(allocation))
-    with open(script_path, "w") as f:
-        f.write(job["command"])
-    popen_args["args"] = ["/bin/sh", script_path]
     try:
+        for key, rsys in resources.items():
+            alloc = rsys.allocate(job["id"], *job["resources"].get(key, (0, None, None)))
+            rsys.reserve(alloc)
+            popen_args = rsys.restrict(alloc, popen_args)
+            allocation[key] = alloc
+        tmpdir = popen_args["env"]["TMPDIR"]
+        pid_path = os.path.join(tmpdir, job["id"] + ".wqpid")
+        alloc_path = os.path.join(tmpdir, job["id"] + ".wqalloc")
+        status_path = os.path.join(tmpdir, job["id"] + ".wqstatus")
+        script_path = os.path.join(tmpdir, job["id"] + ".sh")
+        with open(alloc_path, "wb") as f:
+            f.write(msgspec.json.encode(allocation))
+        with open(script_path, "w") as f:
+            f.write(job["command"])
+        popen_args["args"] = ["/bin/sh", script_path]
         proc = subprocess.run(
                 ["wq", "runcmd", pid_path, status_path],
                 input=msgspec.json.encode(popen_args))
@@ -845,10 +838,11 @@ def start_command(job, resources):
                               status_path=status_path)
     except Exception:
         for key, rsys in resources.items():
-            rsys.free(allocation[key])
+            if key in allocation:
+                rsys.free(allocation[key])
         raise
 
-def take_over_command(job_id, resources):
+def adopt_command(job_id, resources):
     tmpdir = os.environ.get("TMPDIR", "/tmp")
     tmpdir = os.path.join(tmpdir, f"wq_{job_id}")
     pid_path = os.path.join(tmpdir, job_id + ".wqpid")
@@ -924,7 +918,7 @@ async def main_work(config):
                     "stats": system_stats()
                 })
                 for job_id in reg["job_ids"]:
-                    cmd = take_over_command(job_id, resources)
+                    cmd = adopt_command(job_id, resources)
                     commands.append(cmd)
         try:
             while True:
@@ -998,7 +992,7 @@ def status_line(status):
         case "started": return f"started by {status['worker_id']!r}"
         case "reassigned": return f"reassigned to {status['worker_id']!r}"
         case "stopped": return f"stopped by {status['worker_id']!r}"
-        case "done": return f"done by {status['worker_id']!r}"
+        case "done": return f"done by {status['worker_id']!r}, exit code {status['exit_code']}"
         case x: return x
 
 async def main_ls_job(config, job_id):
@@ -1136,10 +1130,10 @@ def real_main():
     config.setdefault("client", {})
     config.setdefault("server", {})
     config.setdefault("worker", {})
-    config["client"].setdefault("server_url", "http://127.0.0.1:8080")
+    config["client"].setdefault("server_url", "http://127.0.0.1:23024")
     config["server"].setdefault("database", os.path.join(datadir, "wqserver.db"))
     config["server"].setdefault("host", "127.0.0.1")
-    config["server"].setdefault("port", 8080)
+    config["server"].setdefault("port", 23024)
 
     match args.cmd:
         case "ls":      asyncio.run(main_ls(config, args.job_id))
@@ -1147,7 +1141,6 @@ def real_main():
         case "serve":   asyncio.run(main_serve(config))
         case "submit":  asyncio.run(main_submit(config, args.name, args.script, args.directory, args.resources, args.priority))
         case "work":    asyncio.run(main_work(config))
-        case _: print(__doc__, end="")
 
 def main():
     try:
