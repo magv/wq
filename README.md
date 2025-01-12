@@ -56,8 +56,6 @@ no more, friends, because now you can just
 - Run `wq work` on each worker machine in a [tmux] or a [screen]
   session.
 
-- Use `wq submit "command"` to submit your jobs.
-
 [pip]: https://pip.pypa.io/
 [pyenv]: https://github.com/pyenv/pyenv
 [python]: https://www.python.org/
@@ -65,3 +63,16 @@ no more, friends, because now you can just
 [tmux]: https://github.com/tmux/tmux/
 [uv]: https://github.com/astral-sh/uv
 [screen]: https://www.gnu.org/software/screen/
+
+## How to use?
+
+- Use `wq submit "command"` to submit your jobs.
+
+- Use `wq ls` to see jobs.
+
+- Use `wq lsw` to see workers.
+
+## Is it any good?
+
+It’s useful, but very preliminary.
+Use at your own risk.
