@@ -66,13 +66,58 @@ no more, friends, because now you can just
 
 ## How to use?
 
-- Use `wq submit "command"` to submit your jobs.
+### Submitting jobs
 
-- Use `wq ls` to see jobs.
+Use `wq submit [-r <resources>] ... <command>` to submit your
+jobs.
 
-- Use `wq lsw` to see workers.
+Each job should ask for resources to be allocated to it:
 
-## Is it any good?
+- To ask for CPUs, there are four options:
+
+  - Ask for logical CPUs (i.e. hyperthreads) using `-r cpu=1`,
+    or `-r cpu=1cpu`. This is the most common option.
+
+  - Ask for whole CPU cores using `-r cpu=1core`. This way all
+    hyperthreads of a given core will be allocated together
+    as a group.
+
+  - Ask for whole CPU sockets (i.e. physical processors) using
+    `-r cpu=1socket`.
+
+  - Ask for every CPU in a given node using `-r cpu=1node`.
+
+- To ask for CPUs with specific feature flags, use `-r
+  cpu=1/avx2+fma`. The feature flags here are exactly as listed
+  in `/proc/cpuinfo`.
+
+- To ask for memory, use `-r mem=1GB`. The recognized units
+  here are `B`, `KB`, `MB`, `GB`, and `TB`.
+
+- To ask for temporary disk storage, use `-r tmp=1GB`. The
+  storage will be allocated in a temporary folder, and the
+  environment variable `TMPDIR` will be set to point to it.
+  After the job is finished, this directory will be removed.
+
+### Listing jobs
+
+Use `wq ls` to see jobs.
+
+Use `wq ls <jobid>` to see a particular job.
+
+### Listing workers
+
+Use `wq lsw` to see workers.
+
+## Q&A
+
+### Is it any good?
 
 It’s useful, but very preliminary.
 Use at your own risk.
+
+### Is it secure?
+
+Not at the moment.
+Right now *everyone* can submit jobs, there is no access control.
+Don’t use this in untrusted environments.

@@ -19,7 +19,7 @@ DESCRIPTION
 
 COMMANDS
 
-    wq submit [-h] [-C workdir] [-r resources] [-p priority] [-n name] command
+    wq add [-h] [-C workdir] [-r resources] [-p priority] [-n name] command
         Submit a command to the server for execution.
 
     wq ls
@@ -37,7 +37,10 @@ COMMANDS
 OPTIONS
     -h          show a help message and exit
     -F config   use this configuration file
+    -C workdir  execute the command in this directory
     -r resources
+    -p priority
+    -n name
 
 CONFIGURATION
 
@@ -309,7 +312,7 @@ class Server:
         job = Job(id=id, name=name, command=command, workdir=workdir, environment=environment, resources=resources, priority=priority, history=[JobStatus_Added(date=time.time())])
         self.jobs[job.id] = job
         self.sync()
-        logf(f"New job {job.id!r}: {maybe_shorten(command, 40)!r}")
+        logf(f"New job {job.id!r} {resources}: {maybe_shorten(command, 40)!r}")
         return {"job_id": job.id}
 
     async def api_register_worker(self, node:str, resources:dict[str,list[tuple[int,str,list[str]]]], system:dict[str,int|float|str], stats:dict[str,int|float]):
@@ -564,18 +567,46 @@ class Resources_CPU:
             allowed = index in affinity
             processors.append(ResourceCPU(index, core, socket, tags, allowed, True))
         self.processors = sorted(processors, key=lambda p: p.index)
-    def units(self):
-        return ("cpu", "core", "socket", "node")
     def allocate(self, jobid:str, count:int, unit:str, fltr:list[str]) -> list[int]:
-        cpus = [p for p in self.processors
-                if p.allowed and p.free and tags_match(p.tags, fltr)]
         match unit:
-            case "cpu": cpus = cpus[:count]
-            #case "core": TODO
-            #case "socket": TODO
-            case "node": pass
+            case "cpu":
+                alloc = []
+                for p in self.processors:
+                    if p.allowed and p.free and tags_match(p.tags, fltr):
+                        alloc.append(p.index)
+                        count -= 1
+                        if count <= 0: break
+                if count > 0:
+                    raise ValueError("Count not find enough CPUs")
+                return alloc
+            case "core":
+                alloc = []
+                for cpus in groupby(self.processors, key=lambda p: p.core).values():
+                    if all(p.allowed and p.free and tags_match(p.tags, fltr) for p in cpus):
+                        alloc.extend(p.index for p in cpus)
+                        count -= 1
+                        if count <= 0: break
+                if count > 0:
+                    raise ValueError("Count not find enough cores")
+                return alloc
+            case "socket":
+                alloc = []
+                for cpus in groupby(self.processors, key=lambda p: p.socket).values():
+                    if all(p.allowed and p.free and tags_match(p.tags, fltr) for p in cpus):
+                        alloc.extend(p.index for p in cpus)
+                        count -= 1
+                        if count <= 0: break
+                if count > 0:
+                    raise ValueError("Count not find enough sockets")
+                return alloc
+            case "node":
+                if count != 1:
+                    raise ValueError("Can allocate only 1 node")
+                for p in self.processors:
+                    if not (p.allowed and p.free and tags_match(p.tags, fltr)):
+                        raise ValueError("Can't allocate every CPUs")
+                return [p.index for p in self.processors]
             case _: raise ValueError(f"Unknown CPU unit {unit!r}")
-        return [p.index for p in cpus]
     def reserve(self, allocation:list[int]) -> None:
         for idx in allocation:
             self.processors[idx].free = False
@@ -611,6 +642,22 @@ class Resources_CPU:
         c = 1 if all(p.allowed and p.free for p in self.processors) else 0
         units.append((c, "node", list(node_tags)))
         return units
+
+def normalize_user_cpu_spec(value:int, unit:str, fltr:list[str]):
+    if unit not in ("", "cpu", "core", "socket", "node"):
+        raise ValueError(f"Unknown unit of CPU: {unit!r}")
+    return (value, unit or "cpu", fltr)
+
+def normalize_user_mem_spec(value:int, unit:str, fltr:list[str]):
+    units = {
+        "": 1024**4, "b": 1,
+        "kb": 1024, "mb": 1024**2, "gb": 1024**3, "tb": 1024**4,
+        "k" : 1024, "m" : 1024**2, "g" : 1024**3, "t" : 1024**4
+    }
+    scale = units.get(unit.lower(), None)
+    if scale is None:
+        raise ValueError(f"Unknown unit of memory: {unit!r}")
+    return (value*scale, "b", fltr)
 
 def parse_quantity(value:str, units:dict[str, float]) -> float:
     m = re.fullmatch("([0-9.]*) *([a-zA-Z]*)", value)
@@ -663,8 +710,6 @@ class Resources_Mem:
         self.available += allocation
     def restrict(self, allocation, popen_args):
         return popen_args
-    def units(self):
-        return ("b",)
     def report(self):
         return [(self.available, "b", [])]
 
@@ -695,8 +740,6 @@ class Resources_Disk:
         popen_args["env"]["FORMTMP"] = tmpdir
         popen_args["env"]["FORMTMPSORT"] = tmpdir
         return popen_args
-    def units(self):
-        return ("b",)
     def report(self):
         return [(self.available, "b", [])]
 
@@ -1071,15 +1114,22 @@ async def main_lsw(config):
         table.sort(key=lambda row: row[1])
         print_table([["id", "hostname", "last seen", "jobs", "load"], []] + table)
 
-async def main_submit(config, name:str|None, script:str, workdir:str, resdefs:list[str], prio:int):
+async def main_add(config, name:str|None, script:str, workdir:str, resdefs:list[str], prio:int):
+    systems = {
+        "cpu": normalize_user_cpu_spec,
+        "mem": normalize_user_mem_spec,
+        "tmp": normalize_user_mem_spec
+    }
     resources = {}
     for spec in resdefs:
-        m = re.match(r"([^=.+]*)(?:[.]([^=.]*))?=([0-9]*)(.*)", spec)
+        # Syntax: <system>=<number><unit>(/<tag>+<tag>...)??
+        m = re.match(r"([^=.+]*)=([0-9]*)([a-zA-Z]*)(?:/(.*))?", spec)
         if m is None:
             raise ValueError(f"Bad resource syntax: {spec}")
-        system, fltr, val, unit = m.groups()
-        # TODO: validate
-        resources[system] = (int(val), unit or None, fltr.split("+") if fltr else [])
+        system, val, unit, fltr = m.groups()
+        if system not in systems:
+            raise ValueError(f"Unknown resource type {system!r}")
+        resources[system] = systems[system](int(val), unit, fltr.split("+") if fltr else [])
     resources.setdefault("cpu", (1, "cpu", []))
     resources.setdefault("mem", (1024**3, "b", []))
     resources.setdefault("tmp", (1024**3, "b", []))
@@ -1108,7 +1158,7 @@ def real_main():
     p.add_argument("job_id", action="store", default=None, nargs="?")
     p = parser_cmd.add_parser("lsw")
     p = parser_cmd.add_parser("work")
-    p = parser_cmd.add_parser("submit")
+    p = parser_cmd.add_parser("add")
     p.add_argument("script")
     p.add_argument("-C", "--directory", action="store", default=os.getcwd())
     p.add_argument("-n", "--name", action="store", default=None)
@@ -1139,7 +1189,7 @@ def real_main():
         case "ls":      asyncio.run(main_ls(config, args.job_id))
         case "lsw":     asyncio.run(main_lsw(config))
         case "serve":   asyncio.run(main_serve(config))
-        case "submit":  asyncio.run(main_submit(config, args.name, args.script, args.directory, args.resources, args.priority))
+        case "add":     asyncio.run(main_add(config, args.name, args.script, args.directory, args.resources, args.priority))
         case "work":    asyncio.run(main_work(config))
 
 def main():
