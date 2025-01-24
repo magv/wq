@@ -34,6 +34,9 @@ COMMANDS
     wq serve
         Start a server.
 
+    wq config
+        Generate (or regenerate) the configuration.
+
 OPTIONS
     -h          show a help message and exit
     -F config   use this configuration file
@@ -71,11 +74,12 @@ import re
 import resource
 import shutil
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
-import tomllib
+import tomlkit
 import traceback
 import typing
 
@@ -145,6 +149,26 @@ def json_encode(val) -> str:
 
 def json_decoder(typ:type):
     return msgspec.json.Decoder(type=typ).decode
+
+def ssl_context(purpose, local_cert, local_key, remote_cert):
+    with tempfile.TemporaryDirectory(prefix="wqtemp") as d:
+        with open(os.path.join(d, "ckeycert.pem"), "w") as f:
+            f.write(f"{local_key}\n{local_cert}")
+        with open(os.path.join(d, "scert.pem"), "w") as f:
+            f.write(remote_cert)
+        ctx = ssl.create_default_context(
+            purpose=purpose, cafile=os.path.join(d, "scert.pem")
+        )
+        ctx.load_cert_chain(certfile=os.path.join(d, "ckeycert.pem"))
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+def atomic_writefile(filename:str, content:str):
+    filename_tmp = filename + ".tmp"
+    with open(filename_tmp, "w") as f:
+        f.write(content)
+    os.rename(filename_tmp, filename)
 
 # SQL (but not really) key-value database
 
@@ -520,7 +544,21 @@ async def main_serve(config):
         web.post("/api/unregister_worker",  webapi(srv.api_unregister_worker)),
         web.post("/api/update_worker",      webapi(srv.api_update_worker)),
     ])
-    await web._run_app(app, host=config["server"]["host"], port=config["server"]["port"])
+    await web._run_app(
+        app,
+        host=config["server"]["host"],
+        port=config["server"]["port"],
+        ssl_context=(
+            ssl_context(
+                ssl.Purpose.CLIENT_AUTH,
+                config["ssl"]["server_cert"],
+                config["ssl"]["server_key"],
+                config["ssl"]["client_cert"],
+            )
+            if "ssl" in config
+            else None
+        )
+    )
 
 # Worker Resources
 
@@ -909,8 +947,22 @@ RPC_MAXSLEEP = 30
 
 class RPC:
     def __init__(self, config):
-        self.server_url = config["client"]["server_url"]
-        self.session = aiohttp.ClientSession()
+        server = (
+            config["client"]["server_host"] + ":" + str(config["client"]["server_port"])
+        )
+        if "ssl" in config:
+            self.server_url = f"https://{server}"
+            ctx = ssl_context(
+                ssl.Purpose.SERVER_AUTH,
+                config["ssl"]["client_cert"],
+                config["ssl"]["client_key"],
+                config["ssl"]["server_cert"],
+            )
+            conn = aiohttp.TCPConnector(ssl_context=ctx)
+        else:
+            self.server_url = f"http://{server}"
+            conn = None
+        self.session = aiohttp.ClientSession(connector=conn)
     async def __aenter__(self):
         await self.session.__aenter__()
         return self
@@ -1019,10 +1071,7 @@ def main_runcmd(pid_path:str, status_path:str):
     def daemon_work():
         proc = subprocess.Popen(**popen_args)
         rcode = proc.wait()
-        status_tmppath = status_path + ".tmp"
-        with open(status_tmppath, "w") as f:
-            f.write(str(rcode))
-        os.rename(status_tmppath, status_path)
+        atomic_writefile(status_path, str(rcode))
     res = forkoff(daemon_start, daemon_work)
     if res != "ok": sys.exit(1)
 
@@ -1144,6 +1193,119 @@ async def main_add(config, name:str|None, script:str, workdir:str, resdefs:list[
         })
         print(jobdata)
 
+def user_input(descr: str, default: str | None, conv):
+    while True:
+        if default is None:
+            val = input(f"{descr}: ")
+        else:
+            val = input(f"{descr} [{default}]: ") or default
+        try:
+            return conv(val)
+        except ValueError:
+            print("Malformed input! Please try again.")
+
+def setup(config):
+    config.setdefault("client", {})
+    config.setdefault("server", {})
+    val = config["client"].get("server_host", "") or config["server"].get("host", "")
+    server_host = user_input("Server IP address or hostname", val, str)
+    val = (
+        config["client"].get("server_port", None)
+        or config["server"].get("port", None)
+        or 23024
+    )
+    server_port = user_input(f"Server port", val, int)
+    val = config["server"].get("database", "")
+    database = user_input(f"Database path on the server", val, str)
+    config["client"]["server_host"] = server_host
+    config["client"]["server_port"] = server_port
+    config["server"]["host"] = server_host
+    config["server"]["port"] = server_port
+    config["server"]["database"] = database
+
+def setup_keys(config):
+    with tempfile.TemporaryDirectory(prefix="wqtmp.") as d:
+        logf(f"Will generate certificate for the client")
+        subprocess.check_call([
+            "openssl",
+            "ecparam",
+            "-out",
+            os.path.join(d, "eckey1.pem"),
+            "-name",
+            "prime256v1",
+            "-genkey",
+        ])
+        subprocess.check_call([
+            "openssl",
+            "req",
+            "-x509",
+            "-new",
+            "-key",
+            os.path.join(d, "eckey1.pem"),
+            "-keyout",
+            os.path.join(d, "ckey.pem"),
+            "-out",
+            os.path.join(d, "ccert.pem"),
+            "-sha256",
+            "-days",
+            "36500",
+            "-nodes",
+            "-subj",
+            "/O=Wq",
+        ])
+        logf("Will generate certificate for the server")
+        subprocess.check_call([
+            "openssl",
+            "ecparam",
+            "-out",
+            os.path.join(d, "eckey2.pem"),
+            "-name",
+            "prime256v1",
+            "-genkey",
+        ])
+        subprocess.check_call([
+            "openssl",
+            "req",
+            "-x509",
+            "-new",
+            "-key",
+            os.path.join(d, "eckey2.pem"),
+            "-keyout",
+            os.path.join(d, "skey.pem"),
+            "-out",
+            os.path.join(d, "scert.pem"),
+            "-sha256",
+            "-days",
+            "36500",
+            "-nodes",
+            "-subj",
+            "/O=Wq",
+        ])
+        with open(os.path.join(d, "scert.pem"), "r") as f:
+            scert = f.read().strip()
+        with open(os.path.join(d, "skey.pem"), "r") as f:
+            skey = f.read().strip()
+        with open(os.path.join(d, "ccert.pem"), "r") as f:
+            ccert = f.read().strip()
+        with open(os.path.join(d, "ckey.pem"), "r") as f:
+            ckey = f.read().strip()
+    config.setdefault("ssl", {})
+    config["ssl"]["server_key"] = tomlkit.string(skey, multiline=True)
+    config["ssl"]["server_cert"] = tomlkit.string(scert, multiline=True)
+    config["ssl"]["client_key"] = tomlkit.string(ckey, multiline=True)
+    config["ssl"]["client_cert"] = tomlkit.string(ccert, multiline=True)
+
+def main_config(config, configpath):
+    setup(config)
+    if "ssl" in config:
+        newval = user_input(f"Regenerate the secret keys (y/n)?", "y", str)
+        if newval in "Yy":
+            setup_keys(config)
+    else:
+        setup_keys(config)
+    logf(f"Will update the config at {configpath}")
+    atomic_writefile(configpath, config.as_string())
+
 def real_main():
     homedir = os.environ["HOME"]
     confdir = os.environ.get("XDG_CONFIG_HOME", os.path.join(homedir, ".config"))
@@ -1167,6 +1329,7 @@ def real_main():
     p = parser_cmd.add_parser("runcmd")
     p.add_argument("pid_path", action="store")
     p.add_argument("status_path", action="store")
+    p = parser_cmd.add_parser("config")
     args = parser.parse_args()
 
     if args.cmd == "runcmd":
@@ -1176,11 +1339,11 @@ def real_main():
     config = {}
     if os.path.exists(args.config):
         with open(args.config, "rb") as f:
-            config = tomllib.load(f)
+            config = tomlkit.load(f)
     config.setdefault("client", {})
     config.setdefault("server", {})
-    config.setdefault("worker", {})
-    config["client"].setdefault("server_url", "http://127.0.0.1:23024")
+    config["client"].setdefault("server_host", "127.0.0.1")
+    config["client"].setdefault("server_port", 23024)
     config["server"].setdefault("database", os.path.join(datadir, "wqserver.db"))
     config["server"].setdefault("host", "127.0.0.1")
     config["server"].setdefault("port", 23024)
@@ -1191,6 +1354,7 @@ def real_main():
         case "serve":   asyncio.run(main_serve(config))
         case "add":     asyncio.run(main_add(config, args.name, args.script, args.directory, args.resources, args.priority))
         case "work":    asyncio.run(main_work(config))
+        case "config":  main_config(config, args.config)
 
 def main():
     try:

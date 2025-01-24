@@ -39,17 +39,12 @@ no more, friends, because now you can just
 
       python3 -m pip install --user git+https://github.com/magv/wq
 
-- Figure out which machine you want to use as a server, and put
-  its IP address into the config file at `~/.config/wq.conf`:
+- Run `wq config` to generate the initial config file at
+  `~/.config/wq.toml`. This command will ask you for the IP
+  address of the machine you want to use as a server.
 
-      [client]
-      server_url = "http://SERVER-IP-HERE:23024"
-
-      [server]
-      host = "SERVER-IP-HERE"
-      port = 23024
-
-  The port can also be chosen freely.
+- Run `wq secure` to generate encryption keys for communication
+  with the server and save them to the config file.
 
 - Run `wq serve` on the server in a [tmux] or a [screen] session.
 
@@ -68,7 +63,7 @@ no more, friends, because now you can just
 
 ### Submitting jobs
 
-Use `wq submit [-r <resources>] ... <command>` to submit your
+Use `wq add [-r <resources>] ... <command>` to submit your
 jobs.
 
 Each job should ask for resources to be allocated to it:
@@ -118,6 +113,7 @@ Use at your own risk.
 
 ### Is it secure?
 
-Not at the moment.
-Right now *everyone* can submit jobs, there is no access control.
-Don’t use this in untrusted environments.
+The communication between the server, the clients, and the workers
+is authenticated and encrypted, but the keys are stored in plain
+text in the config file. As long as this file is secret, wq will
+be secure.

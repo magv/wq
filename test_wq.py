@@ -5,7 +5,7 @@ import signal
 import subprocess
 import tempfile
 import time
-import tomli_w
+import tomlkit
 from subprocess import Popen, check_call, check_output
 
 def file_exists(path, timeout):
@@ -23,13 +23,14 @@ def basic_setup(config={}):
         port = random.randint(10000, 30000)
         config.setdefault("client", {})
         config.setdefault("server", {})
-        config["client"]["server_url"] = f"http://127.0.0.1:{port}"
+        config["client"]["server_host"] = "127.0.0.1"
+        config["client"]["server_port"] = port
         config["server"]["host"] = "127.0.0.1"
         config["server"]["port"] = port
         config["server"]["database"] = os.path.join(tmpdir, "wqserver.db")
         confpath = os.path.join(tmpdir, "wq.toml")
-        with open(confpath, "wb") as f:
-            tomli_w.dump(config, f)
+        with open(confpath, "w") as f:
+            tomlkit.dump(config, f)
         yield {"tmpdir": tmpdir, "wq": ["wq", "-F", confpath]}
 
 def test_basic():
