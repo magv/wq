@@ -43,9 +43,6 @@ no more, friends, because now you can just
   `~/.config/wq.toml`. This command will ask you for the IP
   address of the machine you want to use as a server.
 
-- Run `wq secure` to generate encryption keys for communication
-  with the server and save them to the config file.
-
 - Run `wq serve` on the server in a [tmux] or a [screen] session.
 
 - Run `wq work` on each worker machine in a [tmux] or a [screen]
